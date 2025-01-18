@@ -1,4 +1,4 @@
-module dockerutil
+module github.com/tassa-yoniso-manasi-karoto/dockerutil
 
 go 1.23.4
 
