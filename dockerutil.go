@@ -1,0 +1,398 @@
+// Package dockerutil provides reusable Docker container management functionality
+// for transliteration services.
+package dockerutil
+
+/*
+Package dockerutil provides reusable Docker container management functionality for
+transliteration services. It handles container lifecycle management, including:
+
+- Container initialization and setup
+- Building and rebuilding containers
+- Starting and stopping containers
+- Status monitoring
+- Repository management
+
+*/
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"runtime"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+	"github.com/compose-spec/compose-go/v2/cli"
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/flags"
+	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"github.com/adrg/xdg"
+)
+
+var (
+	// DefaultStartTimeout is the default timeout duration for starting Docker containers
+	DefaultStartTimeout = 300 * time.Second
+	
+	// DefaultRebuildTimeout is the default timeout duration for rebuilding containers
+	DefaultRebuildTimeout = 30 * time.Minute
+	
+	// ErrNotInitialized is returned when operations are attempted before initialization
+	ErrNotInitialized = errors.New("project not initialized, was Init() called?")
+	
+	strFailedStacks = color.Red.Sprintf("Is the required dependency %s correctly installed? ", dockerBackendName()) + "failed to list stacks: %w"
+)
+
+func init() {
+	// logger internal to the library. For the logger relaying docker's log see logger.go's IchiranLogConsumer.Level
+	log.Logger = zerolog.Nop()
+	//log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
+}
+
+// DockerManager handles Docker container lifecycle management
+type DockerManager struct {
+	service     api.Service
+	ctx         context.Context
+	logger      LogConsumer
+	project     *types.Project
+	configDir   string
+	projectName string
+	git         *GitManager
+}
+
+// Config holds configuration options for DockerManager
+type Config struct {
+	ProjectName    string
+	ComposeFile    string
+	RemoteRepo     string
+	RequiredServices []string
+	LogConsumer    LogConsumer
+}
+
+// NewDockerManager creates a new Docker service manager instance
+func NewDockerManager(cfg Config) (*DockerManager, error) {
+	cli, err := command.NewDockerCli()
+	if err != nil {
+		return nil, fmt.Errorf("failed to spawn Docker CLI: %w", err)
+	}
+
+	if err := cli.Initialize(flags.NewClientOptions()); err != nil {
+		return nil, fmt.Errorf("failed to initialize Docker CLI: %w", err)
+	}
+
+	service := compose.NewComposeService(cli)
+	
+	configDir, err := getConfigDir(cfg.ProjectName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get config directory: %w", err)
+	}
+
+	git := NewGitManager(cfg.RemoteRepo, configDir)
+
+	return &DockerManager{
+		service:     service,
+		ctx:        context.Background(),
+		logger:     cfg.LogConsumer,
+		configDir:  configDir,
+		projectName: cfg.ProjectName,
+		git:        git,
+	}, nil
+}
+
+// Init initializes the Docker environment
+func (dm *DockerManager) Init() error {
+	return dm.initialize(false, false)
+}
+
+// InitQuiet initializes with reduced logging
+func (dm *DockerManager) InitQuiet() error {
+	return dm.initialize(false, true)
+}
+
+// InitForce initializes with forced rebuild
+func (dm *DockerManager) InitForce() error {
+	return dm.initialize(true, false)
+}
+
+// initialize handles the core initialization logic
+func (dm *DockerManager) initialize(noCache, quiet bool) error {
+	// Ensure repository is up to date
+	if err := dm.git.EnsureRepo(); err != nil {
+		return fmt.Errorf("failed to ensure repository: %w", err)
+	}
+
+	var needsBuild bool
+	if err := dm.setupProject(); err != nil {
+		log.Warn().Err(err).Msg("setupProject() returned an error")
+		needsBuild = true
+	}
+
+	// Check if project is already running
+	stacks, err := dm.service.List(dm.ctx, api.ListOptions{All: true})
+	if err != nil {
+		return fmt.Errorf(strFailedStacks, err)
+	}
+
+	for _, stack := range stacks {
+		if stack.Name == dm.projectName && standardizeStatus(stack.Status) == api.RUNNING {
+			// Even if running, check if repository needs update
+			needsUpdate, err := dm.git.CheckIfUpdateNeeded()
+			if err != nil {
+				return fmt.Errorf("failed to check repository status: %w", err)
+			}
+			if !needsUpdate {
+				log.Info().Msgf("%s containers already running and up to date", dm.projectName)
+				return nil
+			}
+			needsBuild = true
+			break
+		}
+	}
+
+	if !needsBuild {
+		needsUpdate, err := dm.git.CheckIfUpdateNeeded()
+		if err != nil {
+			return fmt.Errorf("failed to check repository status: %w", err)
+		}
+		needsBuild = needsUpdate
+	}
+
+	if needsBuild {
+		if err := dm.build(noCache, quiet); err != nil {
+			return fmt.Errorf("build failed: %w", err)
+		}
+	}
+
+	if err := dm.up(); err != nil {
+		return fmt.Errorf("up failed: %w", err)
+	}
+
+	return nil
+}
+
+// build handles container building process
+func (dm *DockerManager) build(noCache, quiet bool) error {
+	if dm.project == nil {
+		return ErrNotInitialized
+	}
+
+	buildOpts := api.BuildOptions{
+		NoCache:  noCache,
+		Quiet:    quiet,
+		Services: dm.project.ServiceNames(),
+		Deps:     false,
+	}
+
+	log.Info().Msg("building containers...")
+	if err := dm.service.Build(dm.ctx, dm.project, buildOpts); err != nil {
+		return fmt.Errorf("build failed: %w", err)
+	}
+
+	return nil
+}
+
+// up starts the containers and waits for initialization
+func (dm *DockerManager) up() error {
+	if dm.project == nil {
+		return ErrNotInitialized
+	}
+
+	upDone := make(chan error, 1)
+	go func() {
+		err := dm.service.Up(dm.ctx, dm.project, api.UpOptions{
+			Create: api.CreateOptions{
+				Services:      dm.project.ServiceNames(),
+				RemoveOrphans: true,
+				Recreate:      api.RecreateNever,
+			},
+			Start: api.StartOptions{
+				Wait:         true,
+				WaitTimeout:  DefaultStartTimeout,
+				Project:      dm.project,
+				Services:     dm.project.ServiceNames(),
+				Attach:       dm.logger,
+			},
+		})
+		upDone <- err
+	}()
+
+	select {
+	case err := <-upDone:
+		if err != nil {
+			return fmt.Errorf("container startup failed: %w", err)
+		}
+	case <-time.After(DefaultStartTimeout):
+		return fmt.Errorf("timeout waiting for containers to initialize")
+	}
+
+	status, err := dm.Status()
+	if err != nil {
+		return fmt.Errorf("status check failed: %w", err)
+	}
+	if status != api.RUNNING {
+		return fmt.Errorf("services failed to reach running state, current status: %s", status)
+	}
+
+	return nil
+}
+
+// GetClient returns the underlying Docker client
+func (dm *DockerManager) GetClient() (*client.Client, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Docker client: %w", err)
+	}
+	return cli, nil
+}
+
+// Stop stops all running containers
+func (dm *DockerManager) Stop() error {
+	return dm.service.Stop(dm.ctx, dm.projectName, api.StopOptions{})
+}
+
+// Close implements io.Closer
+func (dm *DockerManager) Close() error {
+	return dm.Stop()
+}
+
+// Status returns the current status of containers
+func (dm *DockerManager) Status() (string, error) {
+	stacks, err := dm.service.List(dm.ctx, api.ListOptions{})
+	if err != nil {
+		return "", fmt.Errorf(strFailedStacks, err)
+	}
+
+	for _, stack := range stacks {
+		if stack.Name == dm.projectName {
+			return standardizeStatus(stack.Status), nil
+		}
+	}
+	return api.UNKNOWN, nil
+}
+
+// setupProject initializes the Docker Compose project configuration
+func (dm *DockerManager) setupProject() error {
+	if dm.project != nil {
+		return nil
+	}
+
+	options, err := cli.NewProjectOptions(
+		[]string{filepath.Join(dm.configDir, "docker-compose.yml")},
+		cli.WithOsEnv,
+		cli.WithDotEnv,
+		cli.WithName(dm.projectName),
+		cli.WithWorkingDirectory(dm.configDir),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create project options: %w", err)
+	}
+
+	project, err := cli.ProjectFromOptions(dm.ctx, options)
+	if err != nil {
+		return fmt.Errorf("failed to load project: %w", err)
+	}
+
+	for name, s := range project.Services {
+		s.CustomLabels = map[string]string{
+			api.ProjectLabel:     project.Name,
+			api.ServiceLabel:     name,
+			api.VersionLabel:     api.ComposeVersion,
+			api.WorkingDirLabel:  project.WorkingDir,
+			api.ConfigFilesLabel: strings.Join(project.ComposeFiles, ","),
+			api.OneoffLabel:      "False",
+		}
+		project.Services[name] = s
+	}
+
+	dm.project = project
+	return nil
+}
+
+// checkIfBuildNeeded determines if containers need rebuilding
+func (dm *DockerManager) checkIfBuildNeeded() (bool, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		return false, fmt.Errorf("failed to create Docker client: %w", err)
+	}
+	defer cli.Close()
+
+	containers, err := cli.ContainerList(context.Background(), container.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	requiredContainers := make(map[string]bool)
+	for _, service := range dm.project.ServiceNames() {
+		containerName := fmt.Sprintf("%s-%s-1", dm.projectName, service)
+		requiredContainers[containerName] = false
+	}
+
+	for _, container := range containers {
+		for _, name := range container.Names {
+			cleanName := strings.TrimPrefix(name, "/")
+			if _, exists := requiredContainers[cleanName]; exists {
+				requiredContainers[cleanName] = true
+			}
+		}
+	}
+
+	for containerName, isRunning := range requiredContainers {
+		if !isRunning {
+			log.Info().Str("container", containerName).Msg("Required container not running")
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// getConfigDir returns the platform-specific configuration directory
+func getConfigDir(projectName string) (string, error) {
+	configPath, err := xdg.ConfigFile(projectName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get config directory: %w", err)
+	}
+	if err := os.MkdirAll(configPath, 0755); err != nil {
+		return "", fmt.Errorf("failed to create config directory: %w", err)
+	}
+	return configPath, nil
+}
+
+// standardizeStatus converts various status formats to standard api status constants
+// fmt of status isn't that of api constants, I've had: running(2), Unknown
+func standardizeStatus(status string) string {
+	status = strings.ToUpper(status)
+	switch {
+	case strings.HasPrefix(status, "RUNNING"):
+		return api.RUNNING
+	case strings.HasPrefix(status, "STARTING"):
+		return api.STARTING
+	case strings.HasPrefix(status, "UPDATING"):
+		return api.UPDATING
+	case strings.HasPrefix(status, "REMOVING"):
+		return api.REMOVING
+	case strings.HasPrefix(status, "UNKNOWN"):
+		return api.UNKNOWN
+	default:
+		return api.FAILED
+	}
+}
+
+func dockerBackendName() string {
+	os := strings.ToLower(runtime.GOOS)
+	
+	switch os {
+	case "darwin", "windows":
+		return "Docker Desktop"
+	default:
+		return "Docker Engine"
+	}
+}
+
