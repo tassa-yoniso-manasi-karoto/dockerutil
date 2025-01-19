@@ -32,9 +32,12 @@ import (
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/compose"
+	
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/adrg/xdg"
+	"github.com/gookit/color"
+	"github.com/k0kubun/pp"
 )
 
 var (
@@ -130,7 +133,7 @@ func (dm *DockerManager) initialize(noCache, quiet bool) error {
 
 	var needsBuild bool
 	if err := dm.setupProject(); err != nil {
-		log.Warn().Err(err).Msg("setupProject() returned an error")
+		return fmt.Errorf("setupProject() returned an error: %w", err)
 		needsBuild = true
 	}
 
@@ -282,9 +285,17 @@ func (dm *DockerManager) setupProject() error {
 	if dm.project != nil {
 		return nil
 	}
+	
+	composeYAMLpath, err := FindComposeFile(dm.configDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("No compose file found in project's repository")
+		}
+		return fmt.Errorf("Error searching for compose file: %v\n", err)
+	}
 
 	options, err := cli.NewProjectOptions(
-		[]string{filepath.Join(dm.configDir, "docker-compose.yml")},
+		[]string{composeYAMLpath},
 		cli.WithOsEnv,
 		cli.WithDotEnv,
 		cli.WithName(dm.projectName),
@@ -385,6 +396,35 @@ func standardizeStatus(status string) string {
 	}
 }
 
+// FindComposeFile searches for a Docker Compose file in the specified directory
+// following the official Compose specification naming scheme.
+// It returns the full path to the first matching file found and nil error if successful,
+// or empty string and error if no compose file is found or if there's an error accessing the directory.
+func FindComposeFile(dirPath string) (string, error) {
+	// Valid filenames according to Compose specification
+	composeFiles := []string{
+		"docker-compose.yml",
+		"docker-compose.yaml",
+		"compose.yml",
+		"compose.yaml",
+	}
+
+	// Check if directory exists and is accessible
+	if _, err := os.Stat(dirPath); err != nil {
+		return "", err
+	}
+
+	// Look for each possible filename
+	for _, filename := range composeFiles {
+		filePath := filepath.Join(dirPath, filename)
+		if _, err := os.Stat(filePath); err == nil {
+			return filePath, nil
+		}
+	}
+
+	return "", os.ErrNotExist
+}
+
 func dockerBackendName() string {
 	os := strings.ToLower(runtime.GOOS)
 	
@@ -395,4 +435,12 @@ func dockerBackendName() string {
 		return "Docker Engine"
 	}
 }
+
+
+
+func placeholder3456543() {
+	color.Redln(" 𝒻*** 𝓎ℴ𝓊 𝒸ℴ𝓂𝓅𝒾𝓁ℯ𝓇")
+	pp.Println("𝓯*** 𝔂𝓸𝓾 𝓬𝓸𝓶𝓹𝓲𝓵𝓮𝓻")
+}
+
 

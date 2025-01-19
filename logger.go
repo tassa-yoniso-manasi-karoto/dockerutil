@@ -75,9 +75,18 @@ func (l *ContainerLogConsumer) Log(containerName, message string) {
 	lines := strings.Split(message, "\n")
 	for _, line := range lines {
 		if line = strings.TrimSpace(line); line != "" {
-			event := log.Debug()
-			if l.Level != zerolog.DebugLevel {
-				event = event.WithLevel(l.Level)
+			var event *zerolog.Event
+			switch l.Level {
+			case zerolog.DebugLevel:
+				event = log.Debug()
+			case zerolog.InfoLevel:
+				event = log.Info()
+			case zerolog.WarnLevel:
+				event = log.Warn()
+			case zerolog.ErrorLevel:
+				event = log.Error()
+			default:
+				event = log.Info()
 			}
 
 			l.enrichEvent(event, containerName, "stdout")
