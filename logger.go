@@ -13,6 +13,7 @@ type LogConsumer interface {
 	Err(containerName, message string)
 	Status(container, msg string)
 	Register(container string)
+	GetInitChan() chan struct{}
 }
 
 // ContainerLogConsumer implements log consumption for Docker containers
@@ -26,19 +27,6 @@ type ContainerLogConsumer struct {
 	InitMessage string // Message that indicates initialization is complete
 }
 
-// NewContainerLogConsumer creates a new log consumer with the specified configuration
-func NewContainerLogConsumer(config LogConfig) *ContainerLogConsumer {
-	return &ContainerLogConsumer{
-		Prefix:      config.Prefix,
-		ShowService: config.ShowService,
-		ShowType:    config.ShowType,
-		Level:       config.LogLevel,
-		InitChan:    make(chan struct{}),
-		FailedChan:  make(chan error),
-		InitMessage: config.InitMessage,
-	}
-}
-
 // LogConfig holds configuration for the log consumer
 type LogConfig struct {
 	Prefix      string
@@ -48,26 +36,23 @@ type LogConfig struct {
 	InitMessage string
 }
 
-// DefaultLogConfig returns a default logging configuration
-func DefaultLogConfig() LogConfig {
-	return LogConfig{
-		Prefix:      "docker",
-		ShowService: true,
-		ShowType:    true,
-		LogLevel:    zerolog.Disabled,
-		InitMessage: "", // Set appropriate default init message
+// NewContainerLogConsumer creates a new log consumer with the specified configuration
+func NewContainerLogConsumer(config LogConfig) *ContainerLogConsumer {
+	return &ContainerLogConsumer{
+		Prefix:      config.Prefix,
+		ShowService: config.ShowService,
+		ShowType:    config.ShowType,
+		Level:       config.LogLevel,
+		InitMessage: config.InitMessage,
+		InitChan:    make(chan struct{}, 100),
+		FailedChan:  make(chan error),
 	}
 }
 
+
 // Log handles stdout messages from containers
 func (l *ContainerLogConsumer) Log(containerName, message string) {
-	if l.InitMessage != "" && strings.Contains(message, l.InitMessage) {
-		select {
-		case l.InitChan <- struct{}{}:
-		default: // Channel already closed or message already sent
-		}
-	}
-	
+	l.checkInit(message)
 	if l.Level == zerolog.Disabled {
 		return
 	}
@@ -97,6 +82,7 @@ func (l *ContainerLogConsumer) Log(containerName, message string) {
 
 // Err handles stderr messages from containers
 func (l *ContainerLogConsumer) Err(containerName, message string) {
+	l.checkInit(message)
 	if l.Level == zerolog.Disabled {
 		return
 	}
@@ -156,3 +142,17 @@ func (l *ContainerLogConsumer) Close() {
 	close(l.InitChan)
 	close(l.FailedChan)
 }
+
+func (l *ContainerLogConsumer) checkInit(message string) {
+	if l.InitMessage != "" && strings.Contains(message, l.InitMessage) {
+		select {
+		case l.InitChan <- struct{}{}:
+		default: // Channel already closed or message already sent
+		}
+	}
+}
+
+func (l *ContainerLogConsumer) GetInitChan() chan struct{} {
+	return l.InitChan
+}
+

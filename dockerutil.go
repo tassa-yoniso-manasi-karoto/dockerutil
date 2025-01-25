@@ -225,8 +225,9 @@ func (dm *DockerManager) up() error {
 		})
 		upDone <- err
 	}()
-
 	select {
+	case <-dm.logger.GetInitChan():
+		log.Info().Msg("container initialization complete")
 	case err := <-upDone:
 		if err != nil {
 			return fmt.Errorf("container startup failed: %w", err)
