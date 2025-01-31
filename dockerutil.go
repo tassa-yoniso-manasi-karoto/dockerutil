@@ -24,7 +24,6 @@ import (
 	"time"
 	"runtime"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
@@ -336,43 +335,6 @@ func (dm *DockerManager) setupProject() error {
 	return nil
 }
 
-// checkIfBuildNeeded determines if containers need rebuilding
-func (dm *DockerManager) checkIfBuildNeeded() (bool, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		return false, fmt.Errorf("failed to create Docker client: %w", err)
-	}
-	defer cli.Close()
-
-	containers, err := cli.ContainerList(context.Background(), container.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list containers: %w", err)
-	}
-
-	requiredContainers := make(map[string]bool)
-	for _, service := range dm.project.ServiceNames() {
-		containerName := fmt.Sprintf("%s-%s-1", dm.projectName, service)
-		requiredContainers[containerName] = false
-	}
-
-	for _, container := range containers {
-		for _, name := range container.Names {
-			cleanName := strings.TrimPrefix(name, "/")
-			if _, exists := requiredContainers[cleanName]; exists {
-				requiredContainers[cleanName] = true
-			}
-		}
-	}
-
-	for containerName, isRunning := range requiredContainers {
-		if !isRunning {
-			log.Info().Str("container", containerName).Msg("Required container not running")
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
 
 // getConfigDir returns the platform-specific configuration directory
 func getConfigDir(projectName string) (string, error) {
