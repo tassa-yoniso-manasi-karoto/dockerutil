@@ -109,23 +109,29 @@ func NewDockerManager(cfg Config) (*DockerManager, error) {
 	}, nil
 }
 
-// Init initializes the Docker environment
+// Init builds and up the containers
 func (dm *DockerManager) Init() error {
-	return dm.initialize(false, false)
+	return dm.initialize(false, false, false)
 }
 
 // InitQuiet initializes with reduced logging
 func (dm *DockerManager) InitQuiet() error {
-	return dm.initialize(false, true)
+	return dm.initialize(false, true, false)
 }
 
-// InitForce initializes with forced rebuild
-func (dm *DockerManager) InitForce() error {
-	return dm.initialize(true, false)
+// InitRecreate remove existing containers, builds and up new containers
+func (dm *DockerManager) InitRecreate() error {
+	return dm.initialize(false, false, true)
+}
+
+// InitRecreateNoCache remove existing containers and downloads the lastest
+// version of dependencies then builds and up the containers
+func (dm *DockerManager) InitRecreateNoCache() error {
+	return dm.initialize(true, false, true)
 }
 
 // initialize handles the core initialization logic
-func (dm *DockerManager) initialize(noCache, quiet bool) error {
+func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 	// Ensure repository is up to date
 	if err := dm.git.EnsureRepo(); err != nil {
 		return fmt.Errorf("failed to ensure repository: %w", err)
@@ -173,7 +179,7 @@ func (dm *DockerManager) initialize(noCache, quiet bool) error {
 		}
 	}
 
-	if err := dm.up(); err != nil {
+	if err := dm.up(recreate); err != nil {
 		return fmt.Errorf("up failed: %w", err)
 	}
 
@@ -202,18 +208,21 @@ func (dm *DockerManager) build(noCache, quiet bool) error {
 }
 
 // up starts the containers and waits for initialization
-func (dm *DockerManager) up() error {
+func (dm *DockerManager) up(recreate bool) error {
 	if dm.project == nil {
 		return ErrNotInitialized
 	}
-
+	r := api.RecreateNever
+	if recreate {
+		r = api.RecreateForce
+	}
 	upDone := make(chan error, 1)
 	go func() {
 		err := dm.service.Up(dm.ctx, dm.project, api.UpOptions{
 			Create: api.CreateOptions{
 				Services:      dm.project.ServiceNames(),
 				RemoveOrphans: true,
-				Recreate:      api.RecreateNever,
+				Recreate:      r,
 			},
 			Start: api.StartOptions{
 				Wait:         true,
