@@ -49,7 +49,7 @@ var (
 	// ErrNotInitialized is returned when operations are attempted before initialization
 	ErrNotInitialized = errors.New("project not initialized, was Init() called?")
 	
-	strFailedStacks = color.Red.Sprintf("Is the required dependency %s correctly installed? ", dockerBackendName()) + "failed to list stacks: %w"
+	strFailedStacks = color.Red.Sprintf("Is the required dependency %s correctly installed? ", DockerBackendName()) + "failed to list stacks: %w"
 )
 
 func init() {
@@ -397,7 +397,7 @@ func FindComposeFile(dirPath string) (string, error) {
 	return "", os.ErrNotExist
 }
 
-func dockerBackendName() string {
+func DockerBackendName() string {
 	os := strings.ToLower(runtime.GOOS)
 	
 	switch os {
