@@ -4,7 +4,6 @@ package dockerutil
 import (
 	"strings"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 // LogConsumer defines the interface for consuming Docker container logs
@@ -63,15 +62,15 @@ func (l *ContainerLogConsumer) Log(containerName, message string) {
 			var event *zerolog.Event
 			switch l.Level {
 			case zerolog.DebugLevel:
-				event = log.Debug()
+				event = DockerLogger.Debug()
 			case zerolog.InfoLevel:
-				event = log.Info()
+				event = DockerLogger.Info()
 			case zerolog.WarnLevel:
-				event = log.Warn()
+				event = DockerLogger.Warn()
 			case zerolog.ErrorLevel:
-				event = log.Error()
+				event = DockerLogger.Error()
 			default:
-				event = log.Info()
+				event = DockerLogger.Info()
 			}
 
 			l.enrichEvent(event, containerName, "stdout")
@@ -90,7 +89,7 @@ func (l *ContainerLogConsumer) Err(containerName, message string) {
 	lines := strings.Split(message, "\n")
 	for _, line := range lines {
 		if line = strings.TrimSpace(line); line != "" {
-			event := log.Error()
+			event := DockerLogger.Error()
 			l.enrichEvent(event, containerName, "stderr")
 			event.Msg(line)
 		}
@@ -103,7 +102,7 @@ func (l *ContainerLogConsumer) Status(container, msg string) {
 		return
 	}
 	
-	event := log.Info()
+	event := DockerLogger.Info()
 	l.enrichEvent(event, container, "status")
 	event.Msg(msg)
 }
@@ -114,7 +113,7 @@ func (l *ContainerLogConsumer) Register(container string) {
 		return
 	}
 
-	event := log.Info()
+	event := DockerLogger.Info()
 	l.enrichEvent(event, container, "register")
 	event.Msg("container registered")
 }
@@ -132,10 +131,6 @@ func (l *ContainerLogConsumer) enrichEvent(event *zerolog.Event, containerName, 
 	}
 }
 
-// SetLogLevel updates the logging level
-func (l *ContainerLogConsumer) SetLogLevel(level zerolog.Level) {
-	l.Level = level
-}
 
 // Close closes the initialization and failure channels
 func (l *ContainerLogConsumer) Close() {

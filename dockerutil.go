@@ -33,7 +33,6 @@ import (
 	"github.com/docker/compose/v2/pkg/compose"
 	
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"github.com/adrg/xdg"
 	"github.com/gookit/color"
 	"github.com/k0kubun/pp"
@@ -44,13 +43,15 @@ var (
 	ErrNotInitialized = errors.New("project not initialized, was Init() called?")
 	
 	strFailedStacks = color.Red.Sprintf("Is the required dependency %s correctly installed? ", DockerBackendName()) + "failed to list stacks: %w"
+	
+	// logger internal to the library:
+	Logger = zerolog.Nop()
+	// docker's logger:
+	// never disable this logger at it is monitored for init message.
+	// To hide logs pass level zerolog.Disabled in LogConfig to NewContainerLogConsumer.
+	DockerLogger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
+	debug = false
 )
-
-func init() {
-	// logger internal to the library. For the logger relaying docker's log see logger.go's IchiranLogConsumer.Level
-	//log.Logger = zerolog.Nop()
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
-}
 
 // DockerManager handles Docker container lifecycle management
 type DockerManager struct {
@@ -81,6 +82,11 @@ type Timeout struct {
 	Start		time.Duration
 }
 
+func init() {
+	if debug {
+		Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
+	}
+}
 
 // NewDockerManager creates a new Docker service manager instance
 func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
@@ -165,7 +171,7 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 				return fmt.Errorf("failed to check repository status: %w", err)
 			}
 			if !needsUpdate {
-				log.Info().Msgf("%s containers already running and up to date", dm.projectName)
+				Logger.Info().Msgf("%s containers already running and up to date", dm.projectName)
 				return nil
 			}
 			recreate = true
@@ -203,6 +209,15 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		r = api.RecreateForce
 		to = dm.Timeout.Recreate
 	}
+	if debug {
+		color.Redln("noCache?", noCache)
+		color.Redln("quiet?", quiet)
+		color.Redln("recreate?", recreate)
+		
+		color.Redln("CreateTimeout", to)
+		color.Redln("StartTimeout", dm.Timeout.Start)
+	}
+	
 	upDone := make(chan error, 1)
 	go func() {
 		err := dm.service.Up(dm.ctx, dm.project, api.UpOptions{
@@ -230,7 +245,7 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 	}()
 	select {
 	case <-dm.logger.GetInitChan():
-		log.Info().Msg("container initialization complete")
+		Logger.Info().Msg("container initialization complete")
 	case err := <-upDone:
 		if err != nil {
 			return fmt.Errorf("container startup failed: %w", err)
@@ -239,8 +254,8 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		return fmt.Errorf("timeout waiting for containers to START")
 	case <-time.After(to):
 		return fmt.Errorf("timeout waiting for containers to BUILD")
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-dm.ctx.Done():
+		return dm.ctx.Err()
 	}
 
 	status, err := dm.Status()
@@ -276,7 +291,7 @@ func (dm *DockerManager) Close() error {
 }
 
 func (dm *DockerManager) Down() error {
-	//log.Info().Msg("removing ichiran containers and resources...")
+	//Logger.Info().Msg("removing ichiran containers and resources...")
 	return dm.service.Down(dm.ctx, dm.projectName, api.DownOptions{
 		RemoveOrphans: true,
 		Volumes:       true,    // Remove volumes as well
