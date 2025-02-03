@@ -40,12 +40,6 @@ import (
 )
 
 var (
-	// DefaultStartTimeout is the default timeout duration for starting Docker containers
-	DefaultStartTimeout = 300 * time.Second
-	
-	// DefaultRebuildTimeout is the default timeout duration for rebuilding containers
-	DefaultRebuildTimeout = 30 * time.Minute
-	
 	// ErrNotInitialized is returned when operations are attempted before initialization
 	ErrNotInitialized = errors.New("project not initialized, was Init() called?")
 	
@@ -67,6 +61,7 @@ type DockerManager struct {
 	configDir   string
 	projectName string
 	git         *GitManager
+	Timeout     Timeout
 }
 
 // Config holds configuration options for DockerManager
@@ -76,10 +71,19 @@ type Config struct {
 	RemoteRepo     string
 	RequiredServices []string
 	LogConsumer    LogConsumer
+	Timeout	       Timeout
 }
 
+type Timeout struct {
+	Create		time.Duration
+	Recreate	time.Duration
+	// until containers reached the running|healthy state
+	Start		time.Duration
+}
+
+
 // NewDockerManager creates a new Docker service manager instance
-func NewDockerManager(cfg Config) (*DockerManager, error) {
+func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
 	cli, err := command.NewDockerCli()
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn Docker CLI: %w", err)
@@ -100,11 +104,12 @@ func NewDockerManager(cfg Config) (*DockerManager, error) {
 
 	return &DockerManager{
 		service:     service,
-		ctx:        context.Background(),
-		logger:     cfg.LogConsumer,
-		configDir:  configDir,
+		ctx:         ctx,
+		logger:      cfg.LogConsumer,
+		configDir:   configDir,
 		projectName: cfg.ProjectName,
-		git:        git,
+		git:         git,
+		Timeout:     cfg.Timeout,
 	}, nil
 }
 
@@ -193,26 +198,29 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		return ErrNotInitialized
 	}
 	r := api.RecreateNever
+	to := dm.Timeout.Create
 	if recreate {
 		r = api.RecreateForce
+		to = dm.Timeout.Recreate
 	}
 	upDone := make(chan error, 1)
 	go func() {
 		err := dm.service.Up(dm.ctx, dm.project, api.UpOptions{
 			Create: api.CreateOptions{
 				Build:         &api.BuildOptions{
-					NoCache:  noCache,
-					Quiet:    quiet,
-					Services: dm.project.ServiceNames(),
-					Deps:     false,
+						NoCache:  noCache,
+						Quiet:    quiet,
+						Services: dm.project.ServiceNames(),
+						Deps:     false,
 				},
 				Services:      dm.project.ServiceNames(),
 				RemoveOrphans: true,
 				Recreate:      r,
+				Timeout:       &to,
 			},
 			Start: api.StartOptions{
 				Wait:         true,
-				WaitTimeout:  DefaultStartTimeout,
+				WaitTimeout:  dm.Timeout.Start,
 				Project:      dm.project,
 				Services:     dm.project.ServiceNames(),
 				Attach:       dm.logger,
@@ -227,8 +235,12 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		if err != nil {
 			return fmt.Errorf("container startup failed: %w", err)
 		}
-	//case <-time.After(DefaultStartTimeout): FIXME
-	//	return fmt.Errorf("timeout waiting for containers to initialize")
+	case <-time.After(to + dm.Timeout.Start):
+		return fmt.Errorf("timeout waiting for containers to START")
+	case <-time.After(to):
+		return fmt.Errorf("timeout waiting for containers to BUILD")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	status, err := dm.Status()
@@ -241,6 +253,8 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 
 	return nil
 }
+
+
 
 // GetClient returns the underlying Docker client
 func (dm *DockerManager) GetClient() (*client.Client, error) {
