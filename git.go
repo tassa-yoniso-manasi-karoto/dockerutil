@@ -25,8 +25,8 @@ func NewGitManager(repoURL, localPath string) *GitManager {
 	}
 }
 
-// EnsureRepo ensures the repository exists and is up to date
-func (gm *GitManager) EnsureRepo() error {
+// EnsureRepo ensures the repository exists
+func (gm *GitManager) EnsureRepoExists() error {
 	gitDir := filepath.Join(gm.localPath, ".git")
 	exists, err := dirExists(gitDir)
 	if err != nil {
@@ -38,13 +38,7 @@ func (gm *GitManager) EnsureRepo() error {
 		if err := gm.clone(); err != nil {
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
-	} else {
-		log.Info().Msg("Local repository exists. Pulling changes...")
-		if err := gm.pull(); err != nil {
-			return fmt.Errorf("failed to pull repository: %w", err)
-		}
 	}
-
 	return nil
 }
 

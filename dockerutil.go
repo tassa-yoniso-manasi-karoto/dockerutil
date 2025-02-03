@@ -54,8 +54,8 @@ var (
 
 func init() {
 	// logger internal to the library. For the logger relaying docker's log see logger.go's IchiranLogConsumer.Level
-	log.Logger = zerolog.Nop()
-	//log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
+	//log.Logger = zerolog.Nop()
+	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
 }
 
 // DockerManager handles Docker container lifecycle management
@@ -120,6 +120,7 @@ func (dm *DockerManager) InitQuiet() error {
 
 // InitRecreate remove existing containers, builds and up new containers
 func (dm *DockerManager) InitRecreate() error {
+	
 	return dm.initialize(false, false, true)
 }
 
@@ -131,15 +132,18 @@ func (dm *DockerManager) InitRecreateNoCache() error {
 
 // initialize handles the core initialization logic
 func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
-	// Ensure repository is up to date
-	if err := dm.git.EnsureRepo(); err != nil {
+	if err := dm.git.EnsureRepoExists(); err != nil {
 		return fmt.Errorf("failed to ensure repository: %w", err)
 	}
-
-	var needsBuild bool
+	needsUpdate, err := dm.git.CheckIfUpdateNeeded()
+	if err != nil {
+		return fmt.Errorf("failed to check repository status: %w", err)
+	}
+	if needsUpdate {
+		recreate = true
+	}
 	if err := dm.setupProject(); err != nil {
 		return fmt.Errorf("setupProject() returned an error: %w", err)
-		needsBuild = true
 	}
 
 	// Check if project is already running
@@ -159,55 +163,32 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 				log.Info().Msgf("%s containers already running and up to date", dm.projectName)
 				return nil
 			}
-			needsBuild = true
+			recreate = true
 			break
 		}
 	}
-
-	if !needsBuild {
-		needsUpdate, err := dm.git.CheckIfUpdateNeeded()
-		if err != nil {
-			return fmt.Errorf("failed to check repository status: %w", err)
-		}
-		needsBuild = needsUpdate
+	
+	// Temporarily change pwd to project to support eventual relative path shenanigans
+	currentDir, _ := os.Getwd()
+	configDir, err := GetConfigDir(dm.projectName)
+	if err != nil {
+		return fmt.Errorf("failed to get config directory: %w", err)
+	}
+	err = os.Chdir(configDir)
+	if err != nil {
+		return fmt.Errorf("failed to change pwd to project directory: %w", err)
 	}
 
-	if needsBuild {
-		if err := dm.build(noCache, quiet); err != nil {
-			return fmt.Errorf("build failed: %w", err)
-		}
-	}
-
-	if err := dm.up(recreate); err != nil {
+	if err := dm.up(noCache, quiet, recreate); err != nil {
 		return fmt.Errorf("up failed: %w", err)
 	}
-
-	return nil
-}
-
-// build handles container building process
-func (dm *DockerManager) build(noCache, quiet bool) error {
-	if dm.project == nil {
-		return ErrNotInitialized
-	}
-
-	buildOpts := api.BuildOptions{
-		NoCache:  noCache,
-		Quiet:    quiet,
-		Services: dm.project.ServiceNames(),
-		Deps:     false,
-	}
-
-	log.Info().Msg("building containers...")
-	if err := dm.service.Build(dm.ctx, dm.project, buildOpts); err != nil {
-		return fmt.Errorf("build failed: %w", err)
-	}
+	os.Chdir(currentDir)
 
 	return nil
 }
 
 // up starts the containers and waits for initialization
-func (dm *DockerManager) up(recreate bool) error {
+func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 	if dm.project == nil {
 		return ErrNotInitialized
 	}
@@ -219,6 +200,12 @@ func (dm *DockerManager) up(recreate bool) error {
 	go func() {
 		err := dm.service.Up(dm.ctx, dm.project, api.UpOptions{
 			Create: api.CreateOptions{
+				Build:         &api.BuildOptions{
+					NoCache:  noCache,
+					Quiet:    quiet,
+					Services: dm.project.ServiceNames(),
+					Deps:     false,
+				},
 				Services:      dm.project.ServiceNames(),
 				RemoveOrphans: true,
 				Recreate:      r,
@@ -240,8 +227,8 @@ func (dm *DockerManager) up(recreate bool) error {
 		if err != nil {
 			return fmt.Errorf("container startup failed: %w", err)
 		}
-	case <-time.After(DefaultStartTimeout):
-		return fmt.Errorf("timeout waiting for containers to initialize")
+	//case <-time.After(DefaultStartTimeout): FIXME
+	//	return fmt.Errorf("timeout waiting for containers to initialize")
 	}
 
 	status, err := dm.Status()
@@ -272,6 +259,15 @@ func (dm *DockerManager) Stop() error {
 // Close implements io.Closer
 func (dm *DockerManager) Close() error {
 	return dm.Stop()
+}
+
+func (dm *DockerManager) Down() error {
+	//log.Info().Msg("removing ichiran containers and resources...")
+	return dm.service.Down(dm.ctx, dm.projectName, api.DownOptions{
+		RemoveOrphans: true,
+		Volumes:       true,    // Remove volumes as well
+		Images:        "local", // Remove locally built images
+	})
 }
 
 // Status returns the current status of containers
