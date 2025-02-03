@@ -150,20 +150,20 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to check repository status: %w", err)
 	}
-	if needsUpdate {
-		recreate = true
-	}
 	if err := dm.setupProject(); err != nil {
 		return fmt.Errorf("setupProject() returned an error: %w", err)
 	}
 
+	if needsUpdate || dm.containersNotBuilt() {
+		recreate = true
+	}
+	
 	// Check if project is already running
 	stacks, err := dm.service.List(dm.ctx, api.ListOptions{All: true})
 	if err != nil {
 		return fmt.Errorf(strFailedStacks, err)
 	}
-
-	for _, stack := range stacks {
+	for idx, stack := range stacks {
 		if stack.Name == dm.projectName && standardizeStatus(stack.Status) == api.RUNNING {
 			// Even if running, check if repository needs update
 			needsUpdate, err := dm.git.CheckIfUpdateNeeded()
@@ -179,24 +179,13 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 		}
 	}
 	
-	// Temporarily change pwd to project to support eventual relative path shenanigans
-	currentDir, _ := os.Getwd()
-	configDir, err := GetConfigDir(dm.projectName)
-	if err != nil {
-		return fmt.Errorf("failed to get config directory: %w", err)
-	}
-	err = os.Chdir(configDir)
-	if err != nil {
-		return fmt.Errorf("failed to change pwd to project directory: %w", err)
-	}
-
 	if err := dm.up(noCache, quiet, recreate); err != nil {
 		return fmt.Errorf("up failed: %w", err)
 	}
-	os.Chdir(currentDir)
 
 	return nil
 }
+
 
 // up starts the containers and waits for initialization
 func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
@@ -349,17 +338,33 @@ func (dm *DockerManager) setupProject() error {
 			api.ProjectLabel:     project.Name,
 			api.ServiceLabel:     name,
 			api.VersionLabel:     api.ComposeVersion,
-			api.WorkingDirLabel:  project.WorkingDir,
+			api.WorkingDirLabel:  dm.configDir,
 			api.ConfigFilesLabel: strings.Join(project.ComposeFiles, ","),
 			api.OneoffLabel:      "False",
 		}
 		project.Services[name] = s
 	}
-
+	
+	// fixes this line in YAML: volumes:  - ${PWD}/docker/pgdata:/var/lib/postgresql/data
+	// which uses shell-substition, completely ignoring both os.Chdir and project.WorkingDir
+	if dm.projectName == "ichiran" {
+		project.Services["pg"].Volumes[0].Source = filepath.Join(dm.configDir, "docker/pgdata")
+		project.Environment["PWD"] = dm.configDir
+	}
+	
 	dm.project = project
 	return nil
 }
 
+
+func (dm *DockerManager) containersNotBuilt() bool {
+	// Retrieve the list of containers for the project.
+	containers, err := dm.service.Ps(dm.ctx, dm.projectName, api.PsOptions{})
+	if err != nil {
+		return false
+	}
+	return len(containers) == 0
+}
 
 // GetConfigDir returns the platform-specific configuration directory
 func GetConfigDir(projectName string) (string, error) {
