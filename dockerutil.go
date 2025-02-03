@@ -91,7 +91,7 @@ func NewDockerManager(cfg Config) (*DockerManager, error) {
 
 	service := compose.NewComposeService(cli)
 	
-	configDir, err := getConfigDir(cfg.ProjectName)
+	configDir, err := GetConfigDir(cfg.ProjectName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get config directory: %w", err)
 	}
@@ -336,8 +336,8 @@ func (dm *DockerManager) setupProject() error {
 }
 
 
-// getConfigDir returns the platform-specific configuration directory
-func getConfigDir(projectName string) (string, error) {
+// GetConfigDir returns the platform-specific configuration directory
+func GetConfigDir(projectName string) (string, error) {
 	configPath, err := xdg.ConfigFile(projectName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get config directory: %w", err)
