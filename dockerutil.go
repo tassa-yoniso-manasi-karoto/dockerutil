@@ -163,7 +163,7 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 	if err != nil {
 		return fmt.Errorf(strFailedStacks, err)
 	}
-	for idx, stack := range stacks {
+	for _, stack := range stacks {
 		if stack.Name == dm.projectName && standardizeStatus(stack.Status) == api.RUNNING {
 			// Even if running, check if repository needs update
 			needsUpdate, err := dm.git.CheckIfUpdateNeeded()
