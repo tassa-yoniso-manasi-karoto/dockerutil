@@ -3,8 +3,63 @@ package dockerutil
 
 import (
 	"strings"
+	"io"
+	"os"
+	"bytes"
+	"time"
+	
 	"github.com/rs/zerolog"
 )
+
+type LogOutput int
+const (
+	LogToNowhere LogOutput = iota
+	LogToStdout
+	LogToBuffer
+	LogToBoth
+)
+
+var (
+	// docker's logger:
+	// never disable this logger at it is monitored for init message.
+	// To hide logs pass level zerolog.Disabled in LogConfig to NewContainerLogConsumer.
+	DockerLogger zerolog.Logger
+	DockerLogBuffer bytes.Buffer
+	logOutput = LogToNowhere
+)
+
+// SetLogOutput configures where Docker logs are written
+func SetLogOutput(output LogOutput) {
+	logOutput = output
+	updateDockerLogger()
+}
+
+func updateDockerLogger() {
+	var writer io.Writer
+
+	switch logOutput {
+	case LogToNowhere:
+		writer = io.Discard
+	case LogToStdout:
+		writer = os.Stdout
+	case LogToBuffer:
+		writer = &DockerLogBuffer
+	case LogToBoth:
+		writer = io.MultiWriter(os.Stdout, &DockerLogBuffer)
+	default:
+		writer = io.MultiWriter(os.Stdout, &DockerLogBuffer)
+	}
+
+	w := zerolog.ConsoleWriter{
+		Out:        writer,
+		TimeFormat: time.TimeOnly,
+	}
+	DockerLogger = zerolog.New(w).With().Timestamp().Logger()
+}
+
+func init() {
+	updateDockerLogger()
+}
 
 // LogConsumer defines the interface for consuming Docker container logs
 type LogConsumer interface {
