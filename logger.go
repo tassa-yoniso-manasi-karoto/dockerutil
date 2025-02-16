@@ -178,6 +178,9 @@ func (l *ContainerLogConsumer) enrichEvent(event *zerolog.Event, containerName, 
 	if l.ShowService {
 		event.Str("service", containerName)
 	}
+	if l.Prefix != "" {
+		event.Str("instance", l.Prefix)
+	}
 }
 
 
