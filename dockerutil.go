@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 	"runtime"
+	"bytes"
+	"io"
 
 	"github.com/docker/docker/client"
 	"github.com/compose-spec/compose-go/v2/cli"
@@ -49,9 +51,18 @@ var (
 	// docker's logger:
 	// never disable this logger at it is monitored for init message.
 	// To hide logs pass level zerolog.Disabled in LogConfig to NewContainerLogConsumer.
-	DockerLogger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
+	DockerLogger zerolog.Logger
+	DockerLogBuffer bytes.Buffer
 	debug = false
 )
+
+func init() {
+	w := zerolog.ConsoleWriter{
+		Out:        io.MultiWriter(os.Stdout, &DockerLogBuffer),
+		TimeFormat: time.TimeOnly,
+	}
+	DockerLogger = zerolog.New(w).With().Timestamp().Logger()
+}
 
 // DockerManager handles Docker container lifecycle management
 type DockerManager struct {
