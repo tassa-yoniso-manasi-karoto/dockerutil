@@ -146,11 +146,14 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to check repository status: %w", err)
 	}
+	if needsUpdate {
+		recreate = true
+		dm.git.pull()
+	}
 	if err := dm.setupProject(); err != nil {
 		return fmt.Errorf("setupProject() returned an error: %w", err)
 	}
-
-	if needsUpdate || dm.containersNotBuilt() {
+	if dm.containersNotBuilt() {
 		recreate = true
 	}
 	
