@@ -313,7 +313,7 @@ func (dm *DockerManager) setupProject() error {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("No compose file found in project's repository")
 		}
-		return fmt.Errorf("Error searching for compose file: %v\n", err)
+		return fmt.Errorf("error searching for compose file: %w", err)
 	}
 
 	options, err := cli.NewProjectOptions(
