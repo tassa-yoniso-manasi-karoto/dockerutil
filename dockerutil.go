@@ -251,7 +251,7 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		return fmt.Errorf("status check failed: %w", err)
 	}
 	if status != api.RUNNING {
-		return fmt.Errorf("services failed to reach running state, current status: %s", status)
+		return fmt.Errorf("services failed to reach running state for %s, current status: %s", dm.project, status)
 	}
 
 	return nil
