@@ -35,25 +35,30 @@ func SetLogOutput(output LogOutput) {
 }
 
 func updateDockerLogger() {
-	var writer io.Writer
+	var writers []io.Writer
 
 	switch logOutput {
 	case LogToNowhere:
-		writer = io.Discard
 	case LogToStdout:
-		writer = os.Stdout
+		writers = append(writers, os.Stdout)
 	case LogToBuffer:
-		writer = &DockerLogBuffer
+		writers = append(writers, &DockerLogBuffer)
 	case LogToBoth:
-		writer = io.MultiWriter(os.Stdout, &DockerLogBuffer)
+		// These will now be independent writers.
+		writers = append(writers, os.Stdout, &DockerLogBuffer)
 	default:
-		writer = io.MultiWriter(os.Stdout, &DockerLogBuffer)
+		writers = append(writers, os.Stdout, &DockerLogBuffer)
 	}
 
+	// Use MultiLevelWriter to handle multiple independent outputs.
+	// ConsoleWriter will be used for all writers in the slice.
+	multiWriter := zerolog.MultiLevelWriter(writers...)
+
 	w := zerolog.ConsoleWriter{
-		Out:        writer,
+		Out:        multiWriter,
 		TimeFormat: time.TimeOnly,
 	}
+
 	DockerLogger = zerolog.New(w).With().Timestamp().Logger()
 }
 
