@@ -7,6 +7,7 @@ import (
 	"os"
 	"bytes"
 	"time"
+	"regexp"
 	
 	"github.com/rs/zerolog"
 )
@@ -75,6 +76,17 @@ type LogConsumer interface {
 	GetInitChan() chan struct{}
 }
 
+// ProgressMilestone represents a log pattern that indicates progress
+type ProgressMilestone struct {
+	Pattern     string  // Regex pattern to match
+	Progress    float64 // Progress percentage (0-100) when this milestone is reached
+	Description string  // User-friendly description
+}
+
+// ProgressHandler is called when milestones are reached
+// The logMessage parameter contains the full log line for extracting additional information
+type ProgressHandler func(progress float64, description string, logMessage string)
+
 // ContainerLogConsumer implements log consumption for Docker containers
 type ContainerLogConsumer struct {
 	Prefix      string
@@ -84,6 +96,9 @@ type ContainerLogConsumer struct {
 	InitChan    chan struct{}
 	FailedChan  chan error
 	InitMessage string // Message that indicates initialization is complete
+	ProgressHandler ProgressHandler
+	Milestones      []ProgressMilestone
+	lastProgress    float64 // Track last progress to avoid duplicate updates
 }
 
 // LogConfig holds configuration for the log consumer
@@ -105,6 +120,7 @@ func NewContainerLogConsumer(config LogConfig) *ContainerLogConsumer {
 		InitMessage: config.InitMessage,
 		InitChan:    make(chan struct{}, 100),
 		FailedChan:  make(chan error),
+		lastProgress: -1,  // Start at -1 so progress=0 will be reported
 	}
 }
 
@@ -112,6 +128,10 @@ func NewContainerLogConsumer(config LogConfig) *ContainerLogConsumer {
 // Log handles stdout messages from containers
 func (l *ContainerLogConsumer) Log(containerName, message string) {
 	l.checkInit(message)
+	
+	// Check for progress milestones
+	l.checkProgress(containerName, message)
+	
 	if l.Level == zerolog.Disabled {
 		return
 	}
@@ -142,6 +162,10 @@ func (l *ContainerLogConsumer) Log(containerName, message string) {
 // Err handles stderr messages from containers
 func (l *ContainerLogConsumer) Err(containerName, message string) {
 	l.checkInit(message)
+	
+	// Check for progress milestones (pg logs often go to stderr)
+	l.checkProgress(containerName, message)
+	
 	if l.Level == zerolog.Disabled {
 		return
 	}
@@ -195,8 +219,33 @@ func (l *ContainerLogConsumer) Close() {
 	close(l.FailedChan)
 }
 
+// checkProgress checks if the message matches any progress milestones
+func (l *ContainerLogConsumer) checkProgress(containerName, message string) {
+	if l.ProgressHandler == nil || l.Milestones == nil {
+		return
+	}
+	
+	// Simply check all milestones against all messages
+	for _, milestone := range l.Milestones {
+		matched, err := regexp.MatchString(milestone.Pattern, message)
+		if err == nil && matched {
+			// Only send update if progress has increased (or is dynamic -1)
+			if milestone.Progress > l.lastProgress || milestone.Progress == -1 {
+				if milestone.Progress >= 0 {
+					l.lastProgress = milestone.Progress
+				}
+				l.ProgressHandler(milestone.Progress, milestone.Description, message)
+			}
+			break
+		}
+	}
+}
+
 func (l *ContainerLogConsumer) checkInit(message string) {
 	if l.InitMessage != "" && strings.Contains(message, l.InitMessage) {
+		// Reset progress tracking for next initialization
+		l.lastProgress = -1
+		
 		select {
 		case l.InitChan <- struct{}{}:
 		default: // Channel already closed or message already sent
