@@ -246,6 +246,12 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		return dm.ctx.Err()
 	}
 
+	// Skip running check for pythainlp - it uses interactive mode
+	if strings.Contains(dm.projectName, "pythainlp") {
+		Logger.Info().Msg("Skipping running state check for pythainlp (interactive mode)")
+		return nil
+	}
+	
 	status, err := dm.Status()
 	if err != nil {
 		return fmt.Errorf("status check failed: %w", err)
@@ -349,6 +355,23 @@ func (dm *DockerManager) setupProject() error {
 	if dm.projectName == "ichiran" {
 		project.Services["pg"].Volumes[0].Source = filepath.Join(dm.configDir, "docker/pgdata")
 		project.Environment["PWD"] = dm.configDir
+	}
+	
+	// Fix for pythainlp: add port mapping
+	if strings.Contains(dm.projectName, "pythainlp") {
+		if service, ok := project.Services["pythainlp"]; ok {
+			// Don't override command - let Python REPL run
+			// service.Command = []string{"/bin/bash", "-c", "while true; do sleep 30; done"}
+			
+			// Add port mapping for the service
+			service.Ports = []types.ServicePortConfig{{
+				Target:    8000,
+				Published: "8000",
+				Protocol:  "tcp",
+			}}
+			
+			project.Services["pythainlp"] = service
+		}
 	}
 	
 	dm.project = project
