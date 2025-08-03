@@ -38,6 +38,10 @@ import (
 	"github.com/k0kubun/pp"
 )
 
+// ServicePortKey is the context key for passing service port information
+type contextKey string
+const ServicePortKey contextKey = "service.port"
+
 var (
 	// ErrNotInitialized is returned when operations are attempted before initialization
 	ErrNotInitialized = errors.New("project not initialized, was Init() called?")
@@ -360,15 +364,13 @@ func (dm *DockerManager) setupProject() error {
 	// Fix for pythainlp: add port mapping
 	if strings.Contains(dm.projectName, "pythainlp") {
 		if service, ok := project.Services["pythainlp"]; ok {
-			// Don't override command - let Python REPL run
-			// service.Command = []string{"/bin/bash", "-c", "while true; do sleep 30; done"}
-			
-			// Add port mapping for the service
-			service.Ports = []types.ServicePortConfig{{
-				Target:    8000,
-				Published: "8000",
-				Protocol:  "tcp",
-			}}
+			if port, ok := dm.ctx.Value(ServicePortKey).(int); ok {
+				service.Ports = []types.ServicePortConfig{{
+					Target:    uint32(port),
+					Published: fmt.Sprintf("%d", port),
+					Protocol:  "tcp",
+				}}
+			}
 			
 			project.Services["pythainlp"] = service
 		}
