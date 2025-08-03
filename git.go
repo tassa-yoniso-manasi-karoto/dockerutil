@@ -123,16 +123,80 @@ func (gm *GitManager) CheckIfUpdateNeeded() (bool, error) {
 		return true, fmt.Errorf("failed to list refs: %w", err)
 	}
 
+	// Find the symbolic HEAD reference to determine default branch
+	var defaultBranch string
+	
 	for _, ref := range refs {
-		if ref.Name().String() == "refs/heads/master" {
-			if head.Hash() != ref.Hash() {
-				DockerLogger.Info().
+		if ref.Name().String() == "HEAD" {
+			// HEAD is a symbolic reference, get its target
+			target := ref.Target()
+			if target != "" {
+				defaultBranch = target.String()
+				DockerLogger.Debug().
 					Str("repo", extractRepoName(gm.repoURL)).
-					Msg("Local and remote HEADs differ, update needed")
-				return true, nil
+					Str("defaultBranch", defaultBranch).
+					Msg("Found default branch from symbolic HEAD")
 			}
 			break
 		}
+	}
+	
+	// If we couldn't resolve symbolic HEAD, try to use the current branch
+	if defaultBranch == "" {
+		// Get current branch name
+		currentRef, err := gm.repo.Head()
+		if err == nil && currentRef.Name().IsBranch() {
+			defaultBranch = currentRef.Name().String()
+			DockerLogger.Debug().
+				Str("repo", extractRepoName(gm.repoURL)).
+				Str("currentBranch", defaultBranch).
+				Msg("Using current branch as default")
+		}
+	}
+	
+	// If we still don't have a branch, try common default branch names
+	if defaultBranch == "" {
+		commonDefaults := []string{"refs/heads/dev", "refs/heads/main", "refs/heads/master"}
+		for _, branchName := range commonDefaults {
+			for _, ref := range refs {
+				if ref.Name().String() == branchName {
+					defaultBranch = branchName
+					DockerLogger.Debug().
+						Str("repo", extractRepoName(gm.repoURL)).
+						Str("defaultBranch", defaultBranch).
+						Msg("Using common default branch name")
+					break
+				}
+			}
+			if defaultBranch != "" {
+				break
+			}
+		}
+	}
+	
+	// Check if update is needed on the default branch
+	if defaultBranch != "" {
+		for _, ref := range refs {
+			if ref.Name().String() == defaultBranch {
+				if head.Hash() != ref.Hash() {
+					DockerLogger.Info().
+						Str("repo", extractRepoName(gm.repoURL)).
+						Str("branch", defaultBranch).
+						Msg("Local and remote HEADs differ, update needed")
+					return true, nil
+				}
+				DockerLogger.Debug().
+					Str("repo", extractRepoName(gm.repoURL)).
+					Str("branch", defaultBranch).
+					Msg("Local repository is up to date")
+				break
+			}
+		}
+	} else {
+		DockerLogger.Warn().
+			Str("repo", extractRepoName(gm.repoURL)).
+			Msg("Could not determine default branch, assuming update needed")
+		return true, nil
 	}
 
 	return false, nil
