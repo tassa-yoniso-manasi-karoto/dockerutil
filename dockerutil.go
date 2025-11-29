@@ -167,17 +167,28 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 		return fmt.Errorf(strFailedStacks, err)
 	}
 	for _, stack := range stacks {
-		if stack.Name == dm.projectName && standardizeStatus(stack.Status) == api.RUNNING {
-			// Even if running, check if repository needs update
-			needsUpdate, err := dm.git.CheckIfUpdateNeeded()
-			if err != nil {
-				return fmt.Errorf("failed to check repository status: %w", err)
+		if stack.Name == dm.projectName {
+			isRunning := standardizeStatus(stack.Status) == api.RUNNING
+			// If recreate was explicitly requested, tear down first to avoid orphan conflicts
+			if recreate {
+				Logger.Info().Msgf("%s: recreate requested, tearing down existing containers", dm.projectName)
+				if err := dm.Down(); err != nil {
+					Logger.Warn().Err(err).Msg("Down() failed, continuing anyway")
+				}
+				break
 			}
-			if !needsUpdate {
-				Logger.Info().Msgf("%s containers already running and up to date", dm.projectName)
-				return nil
+			// Only skip if running AND no update needed
+			if isRunning {
+				needsUpdate, err := dm.git.CheckIfUpdateNeeded()
+				if err != nil {
+					return fmt.Errorf("failed to check repository status: %w", err)
+				}
+				if !needsUpdate {
+					Logger.Info().Msgf("%s containers already running and up to date", dm.projectName)
+					return nil
+				}
+				recreate = true
 			}
-			recreate = true
 			break
 		}
 	}
