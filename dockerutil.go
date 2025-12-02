@@ -61,6 +61,7 @@ type DockerManager struct {
 	project     *types.Project
 	configDir   string
 	projectName string
+	composeFile string // Specific compose file to use (optional)
 	git         *GitManager
 	Timeout     Timeout
 }
@@ -114,6 +115,7 @@ func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
 		logger:      cfg.LogConsumer,
 		configDir:   configDir,
 		projectName: cfg.ProjectName,
+		composeFile: cfg.ComposeFile,
 		git:         git,
 		Timeout:     cfg.Timeout,
 	}, nil
@@ -328,13 +330,24 @@ func (dm *DockerManager) setupProject() error {
 	if dm.project != nil {
 		return nil
 	}
-	
-	composeYAMLpath, err := FindComposeFile(dm.configDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("No compose file found in project's repository")
+
+	var composeYAMLpath string
+	var err error
+
+	// Use specific compose file if configured, otherwise search for standard names
+	if dm.composeFile != "" {
+		composeYAMLpath = filepath.Join(dm.configDir, dm.composeFile)
+		if _, err := os.Stat(composeYAMLpath); err != nil {
+			return fmt.Errorf("specified compose file not found: %s", composeYAMLpath)
 		}
-		return fmt.Errorf("error searching for compose file: %w", err)
+	} else {
+		composeYAMLpath, err = FindComposeFile(dm.configDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("No compose file found in project's repository")
+			}
+			return fmt.Errorf("error searching for compose file: %w", err)
+		}
 	}
 
 	options, err := cli.NewProjectOptions(
