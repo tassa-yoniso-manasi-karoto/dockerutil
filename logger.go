@@ -40,6 +40,7 @@ func updateDockerLogger() {
 
 	switch logOutput {
 	case LogToNowhere:
+		writers = append(writers, io.Discard)
 	case LogToStdout:
 		writers = append(writers, os.Stdout)
 	case LogToBuffer:
