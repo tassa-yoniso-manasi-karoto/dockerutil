@@ -12,6 +12,9 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
 // layerInfo tracks the download state of a single layer
@@ -316,4 +319,189 @@ func doPullImage(ctx context.Context, imageName string, opts PullOptions, state 
 
 	Logger.Info().Str("image", imageName).Msg("Image pull complete and verified")
 	return nil
+}
+
+// ImageManifestInfo contains size information for an image
+type ImageManifestInfo struct {
+	ImageName  string
+	TotalSize  int64
+	LayerCount int
+	Layers     []LayerDigestSize
+}
+
+// LayerDigestSize contains digest and size for a layer
+type LayerDigestSize struct {
+	Digest string
+	Size   int64
+}
+
+// GetImageManifestInfo fetches manifest to get exact layer sizes without pulling.
+// This uses go-containerregistry to query the registry directly.
+func GetImageManifestInfo(ctx context.Context, imageName string) (*ImageManifestInfo, error) {
+	ref, err := name.ParseReference(imageName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse image reference %s: %w", imageName, err)
+	}
+
+	desc, err := remote.Get(ref, remote.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch manifest for %s: %w", imageName, err)
+	}
+
+	img, err := desc.Image()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get image from descriptor for %s: %w", imageName, err)
+	}
+
+	layers, err := img.Layers()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get layers for %s: %w", imageName, err)
+	}
+
+	info := &ImageManifestInfo{
+		ImageName:  imageName,
+		LayerCount: len(layers),
+		Layers:     make([]LayerDigestSize, 0, len(layers)),
+	}
+
+	for _, layer := range layers {
+		digest, err := layer.Digest()
+		if err != nil {
+			Logger.Debug().Err(err).Msg("Failed to get layer digest, skipping")
+			continue
+		}
+		size, err := layer.Size()
+		if err != nil {
+			Logger.Debug().Err(err).Str("digest", digest.String()).Msg("Failed to get layer size, skipping")
+			continue
+		}
+		info.TotalSize += size
+		info.Layers = append(info.Layers, LayerDigestSize{
+			Digest: digest.String(),
+			Size:   size,
+		})
+	}
+
+	Logger.Debug().
+		Str("image", imageName).
+		Int64("total_size", info.TotalSize).
+		Int("layer_count", info.LayerCount).
+		Msg("Fetched manifest info")
+
+	return info, nil
+}
+
+// GetImagesManifestInfo fetches manifests for multiple images, deduplicating shared layers.
+// Returns the total size of unique layers across all images.
+func GetImagesManifestInfo(ctx context.Context, imageNames []string) (totalUniqueBytes int64, layers map[string]int64, err error) {
+	layers = make(map[string]int64)
+
+	for _, imgName := range imageNames {
+		info, err := GetImageManifestInfo(ctx, imgName)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed to get manifest for %s: %w", imgName, err)
+		}
+
+		for _, layer := range info.Layers {
+			// Layers are naturally deduplicated by digest key
+			if _, exists := layers[layer.Digest]; !exists {
+				layers[layer.Digest] = layer.Size
+				totalUniqueBytes += layer.Size
+			}
+		}
+	}
+
+	Logger.Debug().
+		Int("image_count", len(imageNames)).
+		Int("unique_layers", len(layers)).
+		Int64("total_unique_bytes", totalUniqueBytes).
+		Msg("Fetched manifests for multiple images")
+
+	return totalUniqueBytes, layers, nil
+}
+
+// PullImages pulls multiple Docker images with unified progress tracking.
+// Layers shared between images are deduplicated automatically.
+// Progress callback receives accurate (current, total) across all images.
+func PullImages(ctx context.Context, imageNames []string, opts PullOptions) error {
+	if len(imageNames) == 0 {
+		return nil
+	}
+
+	// For single image, just use PullImage
+	if len(imageNames) == 1 {
+		return PullImage(ctx, imageNames[0], opts)
+	}
+
+	// Fetch manifests for accurate total size
+	var totalSize int64
+	totalSize, _, err := GetImagesManifestInfo(ctx, imageNames)
+	if err != nil {
+		Logger.Debug().Err(err).Msg("Failed to fetch manifests, progress total will be 0")
+		totalSize = 0
+	}
+
+	// Shared state across ALL images - layers dedupe naturally by digest
+	state := &pullState{
+		layers: make(map[string]*layerInfo),
+	}
+
+	// Pull each image with shared state
+	for _, imgName := range imageNames {
+		// Wrap opts.OnProgress to pass totalSize
+		imgOpts := opts
+		if opts.OnProgress != nil && totalSize > 0 {
+			imgOpts.OnProgress = func(current, _ int64, status string) {
+				opts.OnProgress(current, totalSize, status)
+			}
+		}
+
+		if err := doPullImageWithState(ctx, imgName, imgOpts, state); err != nil {
+			return fmt.Errorf("failed to pull %s: %w", imgName, err)
+		}
+	}
+
+	return nil
+}
+
+// doPullImageWithState pulls a single image using shared state for layer tracking.
+// This allows accurate progress reporting across multiple images.
+func doPullImageWithState(ctx context.Context, imageName string, opts PullOptions, state *pullState) error {
+	// Apply defaults
+	if opts.InitialInterval == 0 {
+		opts.InitialInterval = 10 * time.Second
+	}
+	if opts.MaxInterval == 0 {
+		opts.MaxInterval = 60 * time.Second
+	}
+
+	// Configure exponential backoff
+	expBackoff := backoff.NewExponentialBackOff(
+		backoff.WithInitialInterval(opts.InitialInterval),
+		backoff.WithMaxInterval(opts.MaxInterval),
+		backoff.WithMaxElapsedTime(opts.MaxElapsedTime),
+	)
+
+	var b backoff.BackOff = expBackoff
+	if opts.MaxRetries > 0 {
+		b = backoff.WithMaxRetries(b, opts.MaxRetries)
+	}
+	b = backoff.WithContext(b, ctx)
+
+	operation := func() error {
+		return doPullImage(ctx, imageName, opts, state)
+	}
+
+	notify := func(err error, duration time.Duration) {
+		Logger.Warn().
+			Err(err).
+			Str("image", imageName).
+			Dur("next_retry_in", duration).
+			Msg("Image pull failed, retrying...")
+		if opts.OnRetry != nil {
+			opts.OnRetry(err, duration)
+		}
+	}
+
+	return backoff.RetryNotify(operation, b, notify)
 }
