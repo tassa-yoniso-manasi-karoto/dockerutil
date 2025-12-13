@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"time"
 
@@ -13,7 +14,9 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
@@ -52,120 +55,99 @@ func DefaultPullOptions() PullOptions {
 	}
 }
 
-// GetImagePullBaseline returns bytes already downloaded for an image's layers.
-// It starts a brief pull to discover cached layers ("Already exists") and learn
-// their sizes from the progress stream. Called internally by PullImage to
-// initialize progress tracking.
+// GetImagePullBaseline calculates bytes already cached locally for an image.
+// It fetches the remote manifest (metadata only, no layer downloads) and compares
+// layer DiffIDs against locally cached layers via Docker's ImageInspect API.
 //
-// Note: Layers marked "Already exists" that we haven't seen downloading before
-// will contribute 0 bytes since Docker doesn't report their size in that status.
-func GetImagePullBaseline(ctx context.Context, imageName string) (int64, error) {
-	Logger.Debug().Str("image", imageName).Msg("Checking baseline for cached layers")
+// Returns (baseline, totalSize, error) where:
+// - baseline: bytes already cached locally
+// - totalSize: total compressed size of all layers
+func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64, totalSize int64, err error) {
+	Logger.Debug().Str("image", imageName).Msg("Checking baseline for cached layers via manifest")
 
+	// Parse image reference
+	ref, err := name.ParseReference(imageName)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse image reference: %w", err)
+	}
+
+	// Fetch remote manifest (metadata only, no layer blob downloads)
+	platform := v1.Platform{OS: "linux", Architecture: runtime.GOARCH}
+	remoteImg, err := remote.Image(ref,
+		remote.WithContext(ctx),
+		remote.WithPlatform(platform),
+		remote.WithAuthFromKeychain(authn.DefaultKeychain),
+	)
+	if err != nil {
+		Logger.Debug().Err(err).Str("image", imageName).Msg("Failed to fetch remote manifest")
+		return 0, 0, fmt.Errorf("failed to fetch manifest: %w", err)
+	}
+
+	layers, err := remoteImg.Layers()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get layers from manifest: %w", err)
+	}
+
+	// Build DiffID -> Size map from remote layers
+	diffIDToSize := make(map[string]int64, len(layers))
+	for _, l := range layers {
+		diffID, err := l.DiffID()
+		if err != nil {
+			Logger.Debug().Err(err).Msg("Failed to get layer DiffID, skipping")
+			continue
+		}
+		size, err := l.Size()
+		if err != nil {
+			Logger.Debug().Err(err).Str("diffID", diffID.String()).Msg("Failed to get layer size, skipping")
+			continue
+		}
+		diffIDToSize[diffID.String()] = size
+		totalSize += size
+	}
+
+	Logger.Debug().
+		Str("image", imageName).
+		Int("layer_count", len(layers)).
+		Int64("total_size", totalSize).
+		Msg("Fetched remote manifest")
+
+	// Check local cache via Docker SDK
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return 0, fmt.Errorf("failed to create Docker client: %w", err)
+		Logger.Debug().Err(err).Msg("Failed to create Docker client, assuming no local cache")
+		return 0, totalSize, nil
 	}
 	defer cli.Close()
 
-	// Check if image already exists completely
-	if imgInfo, _, err := cli.ImageInspectWithRaw(ctx, imageName); err == nil {
-		Logger.Debug().
-			Str("image", imageName).
-			Int64("size", imgInfo.Size).
-			Msg("Image already fully exists")
-		return imgInfo.Size, nil
-	}
-
-	// Use a timeout context to limit how long we scan the stream
-	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	Logger.Debug().Str("image", imageName).Msg("Starting brief pull to discover cached layers")
-
-	reader, err := cli.ImagePull(scanCtx, imageName, image.PullOptions{})
+	info, _, err := cli.ImageInspectWithRaw(ctx, imageName)
 	if err != nil {
-		Logger.Debug().Err(err).Str("image", imageName).Msg("Failed to initiate baseline pull")
-		return 0, fmt.Errorf("failed to initiate pull: %w", err)
-	}
-	defer reader.Close()
-
-	layers := make(map[string]*layerInfo)
-	var alreadyExistsCount int
-
-	decoder := json.NewDecoder(reader)
-	for {
-		var msg jsonmessage.JSONMessage
-		if err := decoder.Decode(&msg); err != nil {
-			if err == io.EOF {
-				break
-			}
-			// Context canceled or timeout - that's fine, we have what we need
-			if scanCtx.Err() != nil {
-				Logger.Debug().Msg("Baseline scan complete (timeout/cancel)")
-				break
-			}
-			return 0, fmt.Errorf("failed to decode pull progress: %w", err)
-		}
-
-		if msg.ID == "" {
-			continue
-		}
-
-		if layers[msg.ID] == nil {
-			layers[msg.ID] = &layerInfo{}
-		}
-		layer := layers[msg.ID]
-
-		// Learn size from Progress.Total
-		if msg.Progress != nil && msg.Progress.Total > 0 {
-			layer.size = msg.Progress.Total
-			Logger.Trace().
-				Str("layer", msg.ID).
-				Int64("size", layer.size).
-				Msg("Learned layer size")
-		}
-
-		// Mark complete if "Already exists"
-		if msg.Status == "Already exists" && !layer.complete {
-			layer.complete = true
-			alreadyExistsCount++
-			Logger.Debug().
-				Str("layer", msg.ID).
-				Int64("size", layer.size).
-				Msg("Layer already exists (cached)")
-		}
-
-		// If we see Downloading start, we've discovered all cached layers
-		if msg.Status == "Downloading" {
-			Logger.Debug().
-				Int("cached_layers", alreadyExistsCount).
-				Int("total_layers", len(layers)).
-				Msg("Download starting, baseline scan complete")
-			cancel()
-			break
-		}
+		Logger.Debug().Str("image", imageName).Msg("Image not in local cache")
+		return 0, totalSize, nil
 	}
 
-	// Sum up completed layers
-	var baseline int64
-	var knownSizeCount int
-	for _, l := range layers {
-		if l.complete {
-			if l.size > 0 {
-				baseline += l.size
-				knownSizeCount++
-			}
+	// Image fully exists locally
+	if info.RootFS.Layers == nil || len(info.RootFS.Layers) == 0 {
+		Logger.Debug().Str("image", imageName).Int64("size", totalSize).Msg("Image fully cached (no layer info)")
+		return totalSize, totalSize, nil
+	}
+
+	// Match local DiffIDs against remote to calculate cached bytes
+	var matchedLayers int
+	for _, localDiffID := range info.RootFS.Layers {
+		if size, ok := diffIDToSize[localDiffID]; ok {
+			baseline += size
+			matchedLayers++
 		}
 	}
 
 	Logger.Debug().
 		Int64("baseline_bytes", baseline).
-		Int("cached_layers", alreadyExistsCount).
-		Int("with_known_size", knownSizeCount).
+		Int64("total_bytes", totalSize).
+		Int("matched_layers", matchedLayers).
+		Int("total_layers", len(layers)).
 		Msg("Baseline calculation complete")
 
-	return baseline, nil
+	return baseline, totalSize, nil
 }
 
 // PullImage pulls a Docker image with retry logic and verification
@@ -198,13 +180,13 @@ func PullImage(ctx context.Context, imageName string, opts PullOptions) error {
 	}
 
 	// Get baseline from any previously cached layers to initialize progress correctly
-	baseline, err := GetImagePullBaseline(ctx, imageName)
+	baseline, totalSize, err := GetImagePullBaseline(ctx, imageName)
 	if err != nil {
 		Logger.Debug().Err(err).Msg("Failed to get baseline, starting from 0")
 	} else if baseline > 0 {
 		// Report initial baseline progress if callback provided
 		if opts.OnProgress != nil {
-			opts.OnProgress(baseline, 0, "Already exists")
+			opts.OnProgress(baseline, totalSize, "Already exists")
 		}
 	}
 
