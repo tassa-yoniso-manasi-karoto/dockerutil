@@ -7,10 +7,9 @@ Package dockerutil provides reusable Docker container management functionality f
 transliteration services. It handles container lifecycle management, including:
 
 - Container initialization and setup
-- Building and rebuilding containers
+- Image pulling with progress tracking
 - Starting and stopping containers
 - Status monitoring
-- Repository management
 
 */
 
@@ -19,23 +18,21 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
-	"runtime"
 
-	"github.com/docker/docker/client"
-	"github.com/compose-spec/compose-go/v2/cli"
+	"github.com/adrg/xdg"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/compose"
-	
-	"github.com/rs/zerolog"
-	"github.com/adrg/xdg"
+	"github.com/docker/docker/client"
+
 	"github.com/gookit/color"
 	"github.com/k0kubun/pp"
+	"github.com/rs/zerolog"
 )
 
 // ServicePortKey is the context key for passing service port information
@@ -55,25 +52,23 @@ var (
 
 // DockerManager handles Docker container lifecycle management
 type DockerManager struct {
-	service     api.Service
-	ctx         context.Context
-	logger      LogConsumer
-	project     *types.Project
-	configDir   string
-	projectName string
-	composeFile string // Specific compose file to use (optional)
-	git         *GitManager
-	Timeout     Timeout
+	service        api.Service
+	ctx            context.Context
+	logger         LogConsumer
+	project        *types.Project
+	projectName    string
+	onPullProgress func(current, total int64, status string)
+	Timeout        Timeout
 }
 
 // Config holds configuration options for DockerManager
 type Config struct {
-	ProjectName    string
-	ComposeFile    string
-	RemoteRepo     string
+	ProjectName      string
+	Project          *types.Project // Compose project defined in Go
 	RequiredServices []string
-	LogConsumer    LogConsumer
-	Timeout	       Timeout
+	LogConsumer      LogConsumer
+	Timeout          Timeout
+	OnPullProgress   func(current, total int64, status string) // Progress callback for image pulls
 }
 
 type Timeout struct {
@@ -91,6 +86,10 @@ func init() {
 
 // NewDockerManager creates a new Docker service manager instance
 func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
+	if cfg.Project == nil {
+		return nil, fmt.Errorf("Config.Project is required")
+	}
+
 	cli, err := command.NewDockerCli()
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn Docker CLI: %w", err)
@@ -101,23 +100,29 @@ func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
 	}
 
 	service := compose.NewComposeService(cli)
-	
-	configDir, err := GetConfigDir(cfg.ProjectName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get config directory: %w", err)
+
+	// Apply custom labels to services
+	project := cfg.Project
+	for name, s := range project.Services {
+		s.CustomLabels = map[string]string{
+			api.ProjectLabel:     project.Name,
+			api.ServiceLabel:     name,
+			api.VersionLabel:     api.ComposeVersion,
+			api.WorkingDirLabel:  "",
+			api.ConfigFilesLabel: "",
+			api.OneoffLabel:      "False",
+		}
+		project.Services[name] = s
 	}
 
-	git := NewGitManager(cfg.RemoteRepo, configDir)
-
 	return &DockerManager{
-		service:     service,
-		ctx:         ctx,
-		logger:      cfg.LogConsumer,
-		configDir:   configDir,
-		projectName: cfg.ProjectName,
-		composeFile: cfg.ComposeFile,
-		git:         git,
-		Timeout:     cfg.Timeout,
+		service:        service,
+		ctx:            ctx,
+		logger:         cfg.LogConsumer,
+		project:        project,
+		projectName:    cfg.ProjectName,
+		onPullProgress: cfg.OnPullProgress,
+		Timeout:        cfg.Timeout,
 	}, nil
 }
 
@@ -145,24 +150,22 @@ func (dm *DockerManager) InitRecreateNoCache() error {
 
 // initialize handles the core initialization logic
 func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
-	if err := dm.git.EnsureRepoExists(); err != nil {
-		return fmt.Errorf("failed to ensure repository: %w", err)
+	// Pull images first with progress tracking
+	images := dm.getImageNames()
+	if len(images) > 0 {
+		opts := DefaultPullOptions()
+		if dm.onPullProgress != nil {
+			opts.OnProgress = dm.onPullProgress
+		}
+		if err := PullImages(dm.ctx, images, opts); err != nil {
+			return fmt.Errorf("failed to pull images: %w", err)
+		}
 	}
-	needsUpdate, err := dm.git.CheckIfUpdateNeeded()
-	if err != nil {
-		return fmt.Errorf("failed to check repository status: %w", err)
-	}
-	if needsUpdate {
-		recreate = true
-		dm.git.pull()
-	}
-	if err := dm.setupProject(); err != nil {
-		return fmt.Errorf("setupProject() returned an error: %w", err)
-	}
+
 	if dm.containersNotBuilt() {
 		recreate = true
 	}
-	
+
 	// Check if project is already running
 	stacks, err := dm.service.List(dm.ctx, api.ListOptions{All: true})
 	if err != nil {
@@ -179,27 +182,31 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 				}
 				break
 			}
-			// Only skip if running AND no update needed
+			// Skip if already running
 			if isRunning {
-				needsUpdate, err := dm.git.CheckIfUpdateNeeded()
-				if err != nil {
-					return fmt.Errorf("failed to check repository status: %w", err)
-				}
-				if !needsUpdate {
-					Logger.Info().Msgf("%s containers already running and up to date", dm.projectName)
-					return nil
-				}
-				recreate = true
+				Logger.Info().Msgf("%s containers already running", dm.projectName)
+				return nil
 			}
 			break
 		}
 	}
-	
+
 	if err := dm.up(noCache, quiet, recreate); err != nil {
 		return fmt.Errorf("up failed: %w", err)
 	}
 
 	return nil
+}
+
+// getImageNames extracts image names from the compose project
+func (dm *DockerManager) getImageNames() []string {
+	var images []string
+	for _, svc := range dm.project.Services {
+		if svc.Image != "" {
+			images = append(images, svc.Image)
+		}
+	}
+	return images
 }
 
 
@@ -325,86 +332,6 @@ func (dm *DockerManager) Status() (string, error) {
 	return api.UNKNOWN, nil
 }
 
-// setupProject initializes the Docker Compose project configuration
-func (dm *DockerManager) setupProject() error {
-	if dm.project != nil {
-		return nil
-	}
-
-	var composeYAMLpath string
-	var err error
-
-	// Use specific compose file if configured, otherwise search for standard names
-	if dm.composeFile != "" {
-		composeYAMLpath = filepath.Join(dm.configDir, dm.composeFile)
-		if _, err := os.Stat(composeYAMLpath); err != nil {
-			return fmt.Errorf("specified compose file not found: %s", composeYAMLpath)
-		}
-	} else {
-		composeYAMLpath, err = FindComposeFile(dm.configDir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("No compose file found in project's repository")
-			}
-			return fmt.Errorf("error searching for compose file: %w", err)
-		}
-	}
-
-	options, err := cli.NewProjectOptions(
-		[]string{composeYAMLpath},
-		cli.WithOsEnv,
-		cli.WithDotEnv,
-		cli.WithName(dm.projectName),
-		cli.WithWorkingDirectory(dm.configDir),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create project options: %w", err)
-	}
-
-	project, err := cli.ProjectFromOptions(dm.ctx, options)
-	if err != nil {
-		return fmt.Errorf("failed to load project: %w", err)
-	}
-
-	for name, s := range project.Services {
-		s.CustomLabels = map[string]string{
-			api.ProjectLabel:     project.Name,
-			api.ServiceLabel:     name,
-			api.VersionLabel:     api.ComposeVersion,
-			api.WorkingDirLabel:  dm.configDir,
-			api.ConfigFilesLabel: strings.Join(project.ComposeFiles, ","),
-			api.OneoffLabel:      "False",
-		}
-		project.Services[name] = s
-	}
-	
-	// fixes this line in YAML: volumes:  - ${PWD}/docker/pgdata:/var/lib/postgresql/data
-	// which uses shell-substition, completely ignoring both os.Chdir and project.WorkingDir
-	if dm.projectName == "ichiran" {
-		project.Services["pg"].Volumes[0].Source = filepath.Join(dm.configDir, "docker/pgdata")
-		project.Environment["PWD"] = dm.configDir
-	}
-	
-	// Fix for pythainlp: add port mapping
-	if strings.Contains(dm.projectName, "pythainlp") {
-		if service, ok := project.Services["pythainlp"]; ok {
-			if port, ok := dm.ctx.Value(ServicePortKey).(int); ok {
-				service.Ports = []types.ServicePortConfig{{
-					Target:    uint32(port),
-					Published: fmt.Sprintf("%d", port),
-					Protocol:  "tcp",
-				}}
-			}
-			
-			project.Services["pythainlp"] = service
-		}
-	}
-	
-	dm.project = project
-	return nil
-}
-
-
 func (dm *DockerManager) containersNotBuilt() bool {
 	// Retrieve the list of containers for the project.
 	containers, err := dm.service.Ps(dm.ctx, dm.projectName, api.PsOptions{})
@@ -444,35 +371,6 @@ func standardizeStatus(status string) string {
 	default:
 		return api.FAILED
 	}
-}
-
-// FindComposeFile searches for a Docker Compose file in the specified directory
-// following the official Compose specification naming scheme.
-// It returns the full path to the first matching file found and nil error if successful,
-// or empty string and error if no compose file is found or if there's an error accessing the directory.
-func FindComposeFile(dirPath string) (string, error) {
-	// Valid filenames according to Compose specification
-	composeFiles := []string{
-		"docker-compose.yml",
-		"docker-compose.yaml",
-		"compose.yml",
-		"compose.yaml",
-	}
-
-	// Check if directory exists and is accessible
-	if _, err := os.Stat(dirPath); err != nil {
-		return "", err
-	}
-
-	// Look for each possible filename
-	for _, filename := range composeFiles {
-		filePath := filepath.Join(dirPath, filename)
-		if _, err := os.Stat(filePath); err == nil {
-			return filePath, nil
-		}
-	}
-
-	return "", os.ErrNotExist
 }
 
 func DockerBackendName() string {
