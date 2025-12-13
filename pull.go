@@ -55,23 +55,14 @@ func DefaultPullOptions() PullOptions {
 	}
 }
 
-// GetImagePullBaseline calculates bytes already cached locally for an image.
-// It fetches the remote manifest (metadata only, no layer downloads) and compares
-// layer DiffIDs against locally cached layers via Docker's ImageInspect API.
-//
-// Returns (baseline, totalSize, error) where:
-// - baseline: bytes already cached locally
-// - totalSize: total compressed size of all layers
-func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64, totalSize int64, err error) {
-	Logger.Debug().Str("image", imageName).Msg("Checking baseline for cached layers via manifest")
-
-	// Parse image reference
+// fetchImageLayers fetches remote manifest and returns raw layer objects.
+// This is the single source of truth for manifest fetching.
+func fetchImageLayers(ctx context.Context, imageName string) ([]v1.Layer, error) {
 	ref, err := name.ParseReference(imageName)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to parse image reference: %w", err)
+		return nil, fmt.Errorf("failed to parse image reference: %w", err)
 	}
 
-	// Fetch remote manifest (metadata only, no layer blob downloads)
 	platform := v1.Platform{OS: "linux", Architecture: runtime.GOARCH}
 	remoteImg, err := remote.Image(ref,
 		remote.WithContext(ctx),
@@ -79,17 +70,26 @@ func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64
 		remote.WithAuthFromKeychain(authn.DefaultKeychain),
 	)
 	if err != nil {
-		Logger.Debug().Err(err).Str("image", imageName).Msg("Failed to fetch remote manifest")
-		return 0, 0, fmt.Errorf("failed to fetch manifest: %w", err)
+		return nil, fmt.Errorf("failed to fetch manifest: %w", err)
 	}
 
 	layers, err := remoteImg.Layers()
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get layers from manifest: %w", err)
+		return nil, fmt.Errorf("failed to get layers from manifest: %w", err)
 	}
 
-	// Build DiffID -> Size map from remote layers
-	diffIDToSize := make(map[string]int64, len(layers))
+	return layers, nil
+}
+
+// getManifestLayers fetches remote manifest and returns layer DiffID -> Size mapping.
+// Used by GetImagePullBaseline for matching against local Docker cache.
+func getManifestLayers(ctx context.Context, imageName string) (diffIDToSize map[string]int64, totalSize int64, err error) {
+	layers, err := fetchImageLayers(ctx, imageName)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	diffIDToSize = make(map[string]int64, len(layers))
 	for _, l := range layers {
 		diffID, err := l.DiffID()
 		if err != nil {
@@ -110,6 +110,25 @@ func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64
 		Int("layer_count", len(layers)).
 		Int64("total_size", totalSize).
 		Msg("Fetched remote manifest")
+
+	return diffIDToSize, totalSize, nil
+}
+
+// GetImagePullBaseline calculates bytes already cached locally for an image.
+// It fetches the remote manifest (metadata only, no layer downloads) and compares
+// layer DiffIDs against locally cached layers via Docker's ImageInspect API.
+//
+// Returns (baseline, totalSize, error) where:
+// - baseline: bytes already cached locally
+// - totalSize: total compressed size of all layers
+func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64, totalSize int64, err error) {
+	Logger.Debug().Str("image", imageName).Msg("Checking baseline for cached layers via manifest")
+
+	diffIDToSize, totalSize, err := getManifestLayers(ctx, imageName)
+	if err != nil {
+		Logger.Debug().Err(err).Str("image", imageName).Msg("Failed to fetch remote manifest")
+		return 0, 0, err
+	}
 
 	// Check local cache via Docker SDK
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -144,7 +163,7 @@ func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64
 		Int64("baseline_bytes", baseline).
 		Int64("total_bytes", totalSize).
 		Int("matched_layers", matchedLayers).
-		Int("total_layers", len(layers)).
+		Int("total_layers", len(diffIDToSize)).
 		Msg("Baseline calculation complete")
 
 	return baseline, totalSize, nil
@@ -152,61 +171,26 @@ func GetImagePullBaseline(ctx context.Context, imageName string) (baseline int64
 
 // PullImage pulls a Docker image with retry logic and verification
 func PullImage(ctx context.Context, imageName string, opts PullOptions) error {
-	// Apply defaults (note: MaxElapsedTime=0 means no limit, so don't override it)
-	if opts.InitialInterval == 0 {
-		opts.InitialInterval = 10 * time.Second
-	}
-	if opts.MaxInterval == 0 {
-		opts.MaxInterval = 60 * time.Second
-	}
-
-	// Configure exponential backoff
-	expBackoff := backoff.NewExponentialBackOff(
-		backoff.WithInitialInterval(opts.InitialInterval),
-		backoff.WithMaxInterval(opts.MaxInterval),
-		backoff.WithMaxElapsedTime(opts.MaxElapsedTime),
-	)
-
-	// Apply max retries first, then context
-	var b backoff.BackOff = expBackoff
-	if opts.MaxRetries > 0 {
-		b = backoff.WithMaxRetries(b, opts.MaxRetries)
-	}
-	b = backoff.WithContext(b, ctx)
-
-	// Shared state across retries - preserves layer progress info
-	state := &pullState{
-		layers: make(map[string]*layerInfo),
-	}
-
-	// Get baseline from any previously cached layers to initialize progress correctly
+	// Get baseline and totalSize from manifest
 	baseline, totalSize, err := GetImagePullBaseline(ctx, imageName)
 	if err != nil {
 		Logger.Debug().Err(err).Msg("Failed to get baseline, starting from 0")
-	} else if baseline > 0 {
-		// Report initial baseline progress if callback provided
-		if opts.OnProgress != nil {
-			opts.OnProgress(baseline, totalSize, "Already exists")
+	} else if baseline > 0 && opts.OnProgress != nil {
+		// Report initial baseline progress
+		opts.OnProgress(baseline, totalSize, "Already exists")
+	}
+
+	// Wrap OnProgress to inject correct totalSize (doPullImage reports 0 for total)
+	pullOpts := opts
+	if opts.OnProgress != nil && totalSize > 0 {
+		pullOpts.OnProgress = func(current, _ int64, status string) {
+			opts.OnProgress(current, totalSize, status)
 		}
 	}
 
-	// Retry with notification
-	operation := func() error {
-		return doPullImage(ctx, imageName, opts, state)
-	}
-
-	notify := func(err error, duration time.Duration) {
-		Logger.Warn().
-			Err(err).
-			Str("image", imageName).
-			Dur("next_retry_in", duration).
-			Msg("Image pull failed, retrying...")
-		if opts.OnRetry != nil {
-			opts.OnRetry(err, duration)
-		}
-	}
-
-	return backoff.RetryNotify(operation, b, notify)
+	// Create state and pull with retry
+	state := &pullState{layers: make(map[string]*layerInfo)}
+	return pullWithRetry(ctx, imageName, pullOpts, state)
 }
 
 func doPullImage(ctx context.Context, imageName string, opts PullOptions, state *pullState) error {
@@ -303,6 +287,48 @@ func doPullImage(ctx context.Context, imageName string, opts PullOptions, state 
 	return nil
 }
 
+// pullWithRetry wraps doPullImage with exponential backoff retry logic.
+// This is the single source of truth for retry configuration.
+func pullWithRetry(ctx context.Context, imageName string, opts PullOptions, state *pullState) error {
+	// Apply defaults
+	if opts.InitialInterval == 0 {
+		opts.InitialInterval = 10 * time.Second
+	}
+	if opts.MaxInterval == 0 {
+		opts.MaxInterval = 60 * time.Second
+	}
+
+	// Configure exponential backoff
+	expBackoff := backoff.NewExponentialBackOff(
+		backoff.WithInitialInterval(opts.InitialInterval),
+		backoff.WithMaxInterval(opts.MaxInterval),
+		backoff.WithMaxElapsedTime(opts.MaxElapsedTime),
+	)
+
+	var b backoff.BackOff = expBackoff
+	if opts.MaxRetries > 0 {
+		b = backoff.WithMaxRetries(b, opts.MaxRetries)
+	}
+	b = backoff.WithContext(b, ctx)
+
+	operation := func() error {
+		return doPullImage(ctx, imageName, opts, state)
+	}
+
+	notify := func(err error, duration time.Duration) {
+		Logger.Warn().
+			Err(err).
+			Str("image", imageName).
+			Dur("next_retry_in", duration).
+			Msg("Image pull failed, retrying...")
+		if opts.OnRetry != nil {
+			opts.OnRetry(err, duration)
+		}
+	}
+
+	return backoff.RetryNotify(operation, b, notify)
+}
+
 // ImageManifestInfo contains size information for an image
 type ImageManifestInfo struct {
 	ImageName  string
@@ -318,26 +344,11 @@ type LayerDigestSize struct {
 }
 
 // GetImageManifestInfo fetches manifest to get exact layer sizes without pulling.
-// This uses go-containerregistry to query the registry directly.
+// Uses Digest for layer identification (suitable for deduplication across images).
 func GetImageManifestInfo(ctx context.Context, imageName string) (*ImageManifestInfo, error) {
-	ref, err := name.ParseReference(imageName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse image reference %s: %w", imageName, err)
-	}
-
-	desc, err := remote.Get(ref, remote.WithContext(ctx))
+	layers, err := fetchImageLayers(ctx, imageName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch manifest for %s: %w", imageName, err)
-	}
-
-	img, err := desc.Image()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get image from descriptor for %s: %w", imageName, err)
-	}
-
-	layers, err := img.Layers()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get layers for %s: %w", imageName, err)
 	}
 
 	info := &ImageManifestInfo{
@@ -428,62 +439,20 @@ func PullImages(ctx context.Context, imageNames []string, opts PullOptions) erro
 		layers: make(map[string]*layerInfo),
 	}
 
+	// Wrap OnProgress to inject totalSize
+	pullOpts := opts
+	if opts.OnProgress != nil && totalSize > 0 {
+		pullOpts.OnProgress = func(current, _ int64, status string) {
+			opts.OnProgress(current, totalSize, status)
+		}
+	}
+
 	// Pull each image with shared state
 	for _, imgName := range imageNames {
-		// Wrap opts.OnProgress to pass totalSize
-		imgOpts := opts
-		if opts.OnProgress != nil && totalSize > 0 {
-			imgOpts.OnProgress = func(current, _ int64, status string) {
-				opts.OnProgress(current, totalSize, status)
-			}
-		}
-
-		if err := doPullImageWithState(ctx, imgName, imgOpts, state); err != nil {
+		if err := pullWithRetry(ctx, imgName, pullOpts, state); err != nil {
 			return fmt.Errorf("failed to pull %s: %w", imgName, err)
 		}
 	}
 
 	return nil
-}
-
-// doPullImageWithState pulls a single image using shared state for layer tracking.
-// This allows accurate progress reporting across multiple images.
-func doPullImageWithState(ctx context.Context, imageName string, opts PullOptions, state *pullState) error {
-	// Apply defaults
-	if opts.InitialInterval == 0 {
-		opts.InitialInterval = 10 * time.Second
-	}
-	if opts.MaxInterval == 0 {
-		opts.MaxInterval = 60 * time.Second
-	}
-
-	// Configure exponential backoff
-	expBackoff := backoff.NewExponentialBackOff(
-		backoff.WithInitialInterval(opts.InitialInterval),
-		backoff.WithMaxInterval(opts.MaxInterval),
-		backoff.WithMaxElapsedTime(opts.MaxElapsedTime),
-	)
-
-	var b backoff.BackOff = expBackoff
-	if opts.MaxRetries > 0 {
-		b = backoff.WithMaxRetries(b, opts.MaxRetries)
-	}
-	b = backoff.WithContext(b, ctx)
-
-	operation := func() error {
-		return doPullImage(ctx, imageName, opts, state)
-	}
-
-	notify := func(err error, duration time.Duration) {
-		Logger.Warn().
-			Err(err).
-			Str("image", imageName).
-			Dur("next_retry_in", duration).
-			Msg("Image pull failed, retrying...")
-		if opts.OnRetry != nil {
-			opts.OnRetry(err, duration)
-		}
-	}
-
-	return backoff.RetryNotify(operation, b, notify)
 }
