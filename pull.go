@@ -47,8 +47,8 @@ func DefaultPullOptions() PullOptions {
 		MaxRetries:      3,
 		InitialInterval: 10 * time.Second,
 		MaxInterval:     60 * time.Second,
-		MaxElapsedTime:  0,              // No time limit - large images can take hours on slow connections
-		ClientTimeout:   3 * time.Minute, // HTTP timeout for headers - generous for high latency connections
+		MaxElapsedTime:  0, // No time limit - large images can take hours on slow connections
+		ClientTimeout:   0, // No HTTP client timeout - body streaming can take arbitrarily long on slow connections
 	}
 }
 
