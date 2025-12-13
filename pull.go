@@ -262,8 +262,11 @@ func doPullImage(ctx context.Context, imageName string, opts PullOptions, state 
 		// Calculate cumulative progress: completed layers + in-progress layers
 		state.mu.Lock()
 		var completedBytes, inProgressBytes int64
+		var completedLayers, totalLayers int
 		for _, l := range state.layers {
+			totalLayers++
 			if l.complete {
+				completedLayers++
 				completedBytes += l.size
 			} else {
 				inProgressBytes += l.current
@@ -274,7 +277,27 @@ func doPullImage(ctx context.Context, imageName string, opts PullOptions, state 
 
 		// Report cumulative progress if callback provided
 		if opts.OnProgress != nil && totalBytes > 0 {
-			opts.OnProgress(totalBytes, 0, msg.Status)
+			// Generate user-friendly status showing overall progress
+			var status string
+			switch msg.Status {
+			case "Downloading":
+				status = fmt.Sprintf("Downloading (%d/%d layers)", completedLayers, totalLayers)
+			case "Extracting":
+				status = fmt.Sprintf("Extracting (%d/%d layers)", completedLayers, totalLayers)
+			case "Pull complete":
+				status = "Pull complete"
+			case "Already exists":
+				// Only show if all layers are cached
+				if completedLayers == totalLayers {
+					status = "Already exists"
+				} else {
+					status = fmt.Sprintf("Downloading (%d/%d layers)", completedLayers, totalLayers)
+				}
+			default:
+				// Skip confusing per-layer statuses like "Download complete"
+				status = fmt.Sprintf("Downloading (%d/%d layers)", completedLayers, totalLayers)
+			}
+			opts.OnProgress(totalBytes, 0, status)
 		}
 	}
 
