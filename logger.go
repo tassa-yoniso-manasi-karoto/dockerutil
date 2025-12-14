@@ -2,13 +2,13 @@
 package dockerutil
 
 import (
-	"strings"
+	"bytes"
 	"io"
 	"os"
-	"bytes"
-	"time"
 	"regexp"
-	
+	"strings"
+	"time"
+
 	"github.com/rs/zerolog"
 )
 
@@ -75,6 +75,7 @@ type LogConsumer interface {
 	Status(container, msg string)
 	Register(container string)
 	GetInitChan() chan struct{}
+	GetInitMessage() string
 }
 
 // ProgressMilestone represents a log pattern that indicates progress
@@ -244,17 +245,24 @@ func (l *ContainerLogConsumer) checkProgress(containerName, message string) {
 
 func (l *ContainerLogConsumer) checkInit(message string) {
 	if l.InitMessage != "" && strings.Contains(message, l.InitMessage) {
+		Logger.Debug().Str("initMessage", l.InitMessage).Str("matched", message).Msg("checkInit: InitMessage matched")
 		// Reset progress tracking for next initialization
 		l.lastProgress = -1
-		
+
 		select {
 		case l.InitChan <- struct{}{}:
+			Logger.Debug().Msg("checkInit: successfully sent to InitChan")
 		default: // Channel already closed or message already sent
+			Logger.Debug().Msg("checkInit: InitChan send failed (channel full or closed)")
 		}
 	}
 }
 
 func (l *ContainerLogConsumer) GetInitChan() chan struct{} {
 	return l.InitChan
+}
+
+func (l *ContainerLogConsumer) GetInitMessage() string {
+	return l.InitMessage
 }
 

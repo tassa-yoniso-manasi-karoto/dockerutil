@@ -138,7 +138,7 @@ func (dm *DockerManager) InitQuiet() error {
 
 // InitRecreate remove existing containers, builds and up new containers
 func (dm *DockerManager) InitRecreate() error {
-	
+	Logger.Debug().Str("project", dm.projectName).Msg("InitRecreate called")
 	return dm.initialize(false, false, true)
 }
 
@@ -195,6 +195,7 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 		return fmt.Errorf("up failed: %w", err)
 	}
 
+	Logger.Debug().Str("project", dm.projectName).Msg("initialize completed successfully")
 	return nil
 }
 
@@ -255,24 +256,31 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		})
 		upDone <- err
 	}()
+	Logger.Debug().Str("project", dm.projectName).Str("initMessage", dm.logger.GetInitMessage()).Msg("up: waiting in select")
 	select {
 	case <-dm.logger.GetInitChan():
-		Logger.Info().Msg("container initialization complete")
+		Logger.Debug().Msg("up: received from InitChan - container initialization complete")
 	case err := <-upDone:
+		Logger.Debug().Err(err).Msg("up: received from upDone")
 		if err != nil {
 			return fmt.Errorf("container startup failed: %w", err)
 		}
 	case <-time.After(to + dm.Timeout.Start):
+		Logger.Debug().Msg("up: timeout waiting for containers to START")
 		return fmt.Errorf("timeout waiting for containers to START")
 	case <-time.After(to):
+		Logger.Debug().Msg("up: timeout waiting for containers to BUILD")
 		return fmt.Errorf("timeout waiting for containers to BUILD")
 	case <-dm.ctx.Done():
+		Logger.Debug().Msg("up: context cancelled")
 		return dm.ctx.Err()
 	}
 
+	Logger.Debug().Str("project", dm.projectName).Msg("up: select completed")
+
 	// Skip running check for pythainlp - it uses interactive mode
 	if strings.Contains(dm.projectName, "pythainlp") {
-		Logger.Info().Msg("Skipping running state check for pythainlp (interactive mode)")
+		Logger.Debug().Msg("up: skipping running state check for pythainlp (interactive mode)")
 		return nil
 	}
 	
