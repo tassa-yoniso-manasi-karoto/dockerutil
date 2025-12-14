@@ -176,8 +176,11 @@ func PullImage(ctx context.Context, imageName string, opts PullOptions) error {
 	if err != nil {
 		Logger.Debug().Err(err).Msg("Failed to get baseline, starting from 0")
 	} else if baseline > 0 && opts.OnProgress != nil {
-		// Report initial baseline progress
-		opts.OnProgress(baseline, totalSize, "Already exists")
+		// Report initial baseline progress:
+		// this is pretty much never seen by the user as if incomplete
+		// "Downloading" status will replace it instantly and thus this
+		// is realistically only visible in case all layers are already pulled
+		opts.OnProgress(baseline, totalSize, "Already installed")
 	}
 
 	// Wrap OnProgress to inject correct totalSize (doPullImage reports 0 for total)
@@ -277,25 +280,12 @@ func doPullImage(ctx context.Context, imageName string, opts PullOptions, state 
 
 		// Report cumulative progress if callback provided
 		if opts.OnProgress != nil && totalBytes > 0 {
-			// Generate user-friendly status showing overall progress
-			var status string
+			status := fmt.Sprintf("Downloading (%d/%d layers)", completedLayers+1, totalLayers)
 			switch msg.Status {
-			case "Downloading":
-				status = fmt.Sprintf("Downloading (%d/%d layers)", completedLayers, totalLayers)
 			case "Extracting":
-				status = fmt.Sprintf("Extracting (%d/%d layers)", completedLayers, totalLayers)
+				status = fmt.Sprintf("Extracting (%d/%d layers)", completedLayers+1, totalLayers)
 			case "Pull complete":
 				status = "Pull complete"
-			case "Already exists":
-				// Only show if all layers are cached
-				if completedLayers == totalLayers {
-					status = "Already exists"
-				} else {
-					status = fmt.Sprintf("Downloading (%d/%d layers)", completedLayers, totalLayers)
-				}
-			default:
-				// Skip confusing per-layer statuses like "Download complete"
-				status = fmt.Sprintf("Downloading (%d/%d layers)", completedLayers, totalLayers)
 			}
 			opts.OnProgress(totalBytes, 0, status)
 		}
