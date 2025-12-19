@@ -341,8 +341,8 @@ func (dm *DockerManager) Status() (string, error) {
 }
 
 func (dm *DockerManager) containersNotBuilt() bool {
-	// Retrieve the list of containers for the project.
-	containers, err := dm.service.Ps(dm.ctx, dm.projectName, api.PsOptions{})
+	// Retrieve the list of containers for the project (including stopped ones).
+	containers, err := dm.service.Ps(dm.ctx, dm.projectName, api.PsOptions{All: true})
 	if err != nil {
 		return false
 	}
