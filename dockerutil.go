@@ -307,8 +307,11 @@ func (dm *DockerManager) GetClient() (*client.Client, error) {
 }
 
 // Stop stops all running containers
+// Uses a fresh context to ensure cleanup succeeds even if original context was canceled
 func (dm *DockerManager) Stop() error {
-	return dm.service.Stop(dm.ctx, dm.projectName, api.StopOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return dm.service.Stop(ctx, dm.projectName, api.StopOptions{})
 }
 
 // Close implements io.Closer
@@ -317,8 +320,10 @@ func (dm *DockerManager) Close() error {
 }
 
 func (dm *DockerManager) Down() error {
-	//Logger.Info().Msg("removing ichiran containers and resources...")
-	return dm.service.Down(dm.ctx, dm.projectName, api.DownOptions{
+	// Uses a fresh context to ensure cleanup succeeds even if original context was canceled
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return dm.service.Down(ctx, dm.projectName, api.DownOptions{
 		RemoveOrphans: true,
 		Volumes:       true,    // Remove volumes as well
 		Images:        "local", // Remove locally built images
