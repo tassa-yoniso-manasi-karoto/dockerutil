@@ -26,8 +26,8 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/docker/docker/client"
 
 	"github.com/gookit/color"
@@ -37,6 +37,7 @@ import (
 
 // ServicePortKey is the context key for passing service port information
 type contextKey string
+
 const ServicePortKey contextKey = "service.port"
 
 var (
@@ -52,7 +53,7 @@ var (
 
 // DockerManager handles Docker container lifecycle management
 type DockerManager struct {
-	service        api.Service
+	service        api.Compose
 	ctx            context.Context
 	logger         LogConsumer
 	project        *types.Project
@@ -99,7 +100,10 @@ func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
 		return nil, fmt.Errorf("failed to initialize Docker CLI: %w", err)
 	}
 
-	service := compose.NewComposeService(cli)
+	service, err := compose.NewComposeService(cli)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Compose service: %w", err)
+	}
 
 	// Apply custom labels to services
 	project := cfg.Project
@@ -289,7 +293,7 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		return fmt.Errorf("status check failed: %w", err)
 	}
 	if status != api.RUNNING {
-		return fmt.Errorf("services failed to reach running state for %s, current status: %s", dm.project, status)
+		return fmt.Errorf("services failed to reach running state for %s, current status: %s", dm.projectName, status)
 	}
 
 	return nil
