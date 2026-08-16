@@ -10,6 +10,8 @@ require (
 	github.com/docker/compose/v5 v5.1.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/google/go-containerregistry v0.21.2
+	github.com/gofrs/flock v0.13.0
+	github.com/google/uuid v1.6.0
 	github.com/gookit/color v1.6.0
 	github.com/k0kubun/pp v3.0.1+incompatible
 	github.com/rs/zerolog v1.34.0
@@ -49,13 +51,11 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect

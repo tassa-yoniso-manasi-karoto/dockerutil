@@ -58,14 +58,17 @@ type DockerManager struct {
 	logger         LogConsumer
 	project        *types.Project
 	projectName    string
+	projectLease   *ProjectLease
+	requiredServices []string
 	onPullProgress func(current, total int64, status string)
 	Timeout        Timeout
 }
 
 // Config holds configuration options for DockerManager
 type Config struct {
-	ProjectName      string
+	ProjectName      string // Deprecated: the project identity is Config.Project.Name.
 	Project          *types.Project // Compose project defined in Go
+	ProjectLease     *ProjectLease
 	RequiredServices []string
 	LogConsumer      LogConsumer
 	Timeout          Timeout
@@ -73,10 +76,26 @@ type Config struct {
 }
 
 type Timeout struct {
-	Create		time.Duration
-	Recreate	time.Duration
+	Create   time.Duration
+	Recreate time.Duration
 	// until containers reached the running|healthy state
-	Start		time.Duration
+	Start time.Duration
+}
+
+type DownOptions struct {
+	RemoveOrphans bool
+	RemoveVolumes bool
+	RemoveImages  string
+	Timeout       time.Duration
+}
+
+func SafeDownOptions() DownOptions {
+	return DownOptions{
+		RemoveOrphans: true,
+		RemoveVolumes: false,
+		RemoveImages:  "",
+		Timeout:       60 * time.Second,
+	}
 }
 
 func init() {
@@ -90,33 +109,63 @@ func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
 	if cfg.Project == nil {
 		return nil, fmt.Errorf("Config.Project is required")
 	}
+	if cfg.ProjectName != "" && cfg.ProjectName != cfg.Project.Name {
+		return nil, fmt.Errorf("Config.ProjectName %q does not match Config.Project.Name %q", cfg.ProjectName, cfg.Project.Name)
+	}
+	if !projectNamePattern.MatchString(cfg.Project.Name) {
+		return nil, fmt.Errorf("invalid Compose project name %q", cfg.Project.Name)
+	}
+	if cfg.ProjectLease != nil {
+		if err := cfg.ProjectLease.bindProject(cfg.Project); err != nil {
+			return nil, err
+		}
+	}
 
-	cli, err := command.NewDockerCli()
+	service, err := newComposeService()
 	if err != nil {
-		return nil, fmt.Errorf("failed to spawn Docker CLI: %w", err)
+		return nil, err
 	}
 
-	if err := cli.Initialize(flags.NewClientOptions()); err != nil {
-		return nil, fmt.Errorf("failed to initialize Docker CLI: %w", err)
+	ownershipLabels := map[string]string{}
+	if cfg.ProjectLease != nil {
+		ownershipLabels = cfg.ProjectLease.Labels()
 	}
 
-	service, err := compose.NewComposeService(cli)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Compose service: %w", err)
-	}
-
-	// Apply custom labels to services
+	// Compose projects created programmatically do not pass through the loader,
+	// so apply its standard labels while preserving ownership labels.
 	project := cfg.Project
 	for name, s := range project.Services {
-		s.CustomLabels = map[string]string{
-			api.ProjectLabel:     project.Name,
-			api.ServiceLabel:     name,
-			api.VersionLabel:     api.ComposeVersion,
-			api.WorkingDirLabel:  "",
-			api.ConfigFilesLabel: "",
-			api.OneoffLabel:      "False",
+		if s.CustomLabels == nil {
+			s.CustomLabels = types.Labels{}
+		}
+		s.CustomLabels[api.ProjectLabel] = project.Name
+		s.CustomLabels[api.ServiceLabel] = name
+		s.CustomLabels[api.VersionLabel] = api.ComposeVersion
+		s.CustomLabels[api.WorkingDirLabel] = ""
+		s.CustomLabels[api.ConfigFilesLabel] = ""
+		s.CustomLabels[api.OneoffLabel] = "False"
+		for key, value := range ownershipLabels {
+			s.CustomLabels[key] = value
 		}
 		project.Services[name] = s
+	}
+	for name, network := range project.Networks {
+		if network.CustomLabels == nil {
+			network.CustomLabels = types.Labels{}
+		}
+		for key, value := range ownershipLabels {
+			network.CustomLabels[key] = value
+		}
+		project.Networks[name] = network
+	}
+	for name, volume := range project.Volumes {
+		if volume.CustomLabels == nil {
+			volume.CustomLabels = types.Labels{}
+		}
+		for key, value := range ownershipLabels {
+			volume.CustomLabels[key] = value
+		}
+		project.Volumes[name] = volume
 	}
 
 	return &DockerManager{
@@ -124,10 +173,27 @@ func NewDockerManager(ctx context.Context, cfg Config) (*DockerManager, error) {
 		ctx:            ctx,
 		logger:         cfg.LogConsumer,
 		project:        project,
-		projectName:    cfg.ProjectName,
+		projectName:    project.Name,
+		projectLease:   cfg.ProjectLease,
+		requiredServices: append([]string(nil), cfg.RequiredServices...),
 		onPullProgress: cfg.OnPullProgress,
 		Timeout:        cfg.Timeout,
 	}, nil
+}
+
+func newComposeService() (api.Compose, error) {
+	cli, err := command.NewDockerCli()
+	if err != nil {
+		return nil, fmt.Errorf("failed to spawn Docker CLI: %w", err)
+	}
+	if err := cli.Initialize(flags.NewClientOptions()); err != nil {
+		return nil, fmt.Errorf("failed to initialize Docker CLI: %w", err)
+	}
+	service, err := compose.NewComposeService(cli)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Compose service: %w", err)
+	}
+	return service, nil
 }
 
 // Init builds and up the containers
@@ -154,6 +220,16 @@ func (dm *DockerManager) InitRecreateNoCache() error {
 
 // initialize handles the core initialization logic
 func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
+	unlockSharedOperation := func() {}
+	if dm.projectLease != nil && dm.projectLease.Lifecycle() == LifecycleShared {
+		var err error
+		unlockSharedOperation, err = dm.projectLease.lockSharedOperation(dm.ctx, recreate)
+		if err != nil {
+			return fmt.Errorf("shared project %s is busy: %w", dm.projectName, err)
+		}
+		defer unlockSharedOperation()
+	}
+
 	// Pull images first with progress tracking
 	images := dm.getImageNames()
 	if len(images) > 0 {
@@ -178,10 +254,26 @@ func (dm *DockerManager) initialize(noCache, quiet, recreate bool) error {
 	for _, stack := range stacks {
 		if stack.Name == dm.projectName {
 			isRunning := standardizeStatus(stack.Status) == api.RUNNING
+			if dm.projectLease != nil && dm.projectLease.Lifecycle() == LifecycleShared {
+				managed, ownershipErr := dm.hasManagedOwnership()
+				if ownershipErr != nil {
+					return ownershipErr
+				}
+				if !managed {
+					dm.projectLease.markLegacy()
+					if recreate {
+						return fmt.Errorf("%w: stop and remove project %s manually before recreating it", ErrLegacyProject, dm.projectName)
+					}
+					if isRunning {
+						Logger.Warn().Str("project", dm.projectName).Msg("Attached to legacy shared project; automatic teardown is disabled")
+						return nil
+					}
+				}
+			}
 			// If recreate was explicitly requested, tear down first to avoid orphan conflicts
 			if recreate {
 				Logger.Info().Msgf("%s: recreate requested, tearing down existing containers", dm.projectName)
-				if err := dm.Down(); err != nil {
+				if err := dm.down(dm.ctx, SafeDownOptions()); err != nil {
 					Logger.Warn().Err(err).Msg("Down() failed, continuing anyway")
 				}
 				break
@@ -282,10 +374,8 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 
 	Logger.Debug().Str("project", dm.projectName).Msg("up: select completed")
 
-	// Skip running check for pythainlp - it uses interactive mode
-	if strings.Contains(dm.projectName, "pythainlp") {
-		Logger.Debug().Msg("up: skipping running state check for pythainlp (interactive mode)")
-		return nil
+	if len(dm.requiredServices) > 0 {
+		return dm.validateRequiredServices()
 	}
 	
 	status, err := dm.Status()
@@ -296,6 +386,26 @@ func (dm *DockerManager) up(noCache, quiet, recreate bool) error {
 		return fmt.Errorf("services failed to reach running state for %s, current status: %s", dm.projectName, status)
 	}
 
+	return nil
+}
+
+func (dm *DockerManager) validateRequiredServices() error {
+	containers, err := dm.service.Ps(dm.ctx, dm.projectName, api.PsOptions{
+		All:      true,
+		Services: dm.requiredServices,
+	})
+	if err != nil {
+		return fmt.Errorf("list required services: %w", err)
+	}
+	states := make(map[string]string, len(containers))
+	for _, container := range containers {
+		states[container.Service] = string(container.State)
+	}
+	for _, serviceName := range dm.requiredServices {
+		if states[serviceName] != "running" {
+			return fmt.Errorf("service %s failed to reach running state, current state: %s", serviceName, states[serviceName])
+		}
+	}
 	return nil
 }
 
@@ -310,28 +420,136 @@ func (dm *DockerManager) GetClient() (*client.Client, error) {
 	return cli, nil
 }
 
-// Stop stops all running containers
-// Uses a fresh context to ensure cleanup succeeds even if original context was canceled
+// Stop stops all running containers without removing the Compose project.
 func (dm *DockerManager) Stop() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return dm.StopWithContext(context.Background())
+}
+
+// StopWithContext stops all running containers with a caller-provided context.
+func (dm *DockerManager) StopWithContext(ctx context.Context) error {
+	unlockSharedOperation := func() {}
+	if dm.projectLease != nil && dm.projectLease.Lifecycle() == LifecycleShared {
+		var err error
+		unlockSharedOperation, err = dm.projectLease.lockSharedOperation(ctx, true)
+		if err != nil {
+			return fmt.Errorf("shared project %s cannot be stopped: %w", dm.projectName, err)
+		}
+		defer unlockSharedOperation()
+	}
+	ctx, cancel := context.WithTimeout(cleanupParent(ctx), 30*time.Second)
 	defer cancel()
 	return dm.service.Stop(ctx, dm.projectName, api.StopOptions{})
 }
 
-// Close implements io.Closer
+// Close releases this manager's project lease using a background context.
 func (dm *DockerManager) Close() error {
-	return dm.Stop()
+	return dm.CloseWithContext(context.Background())
 }
 
+// CloseWithContext releases this manager's project lease. The final owner
+// removes the Compose project with safe teardown options.
+func (dm *DockerManager) CloseWithContext(ctx context.Context) error {
+	down := func(closeCtx context.Context) error {
+		if dm.projectLease != nil && !dm.projectLease.isLegacy() {
+			if err := validateProjectOwnership(closeCtx, dm.projectName, dm.projectLease.Labels()); err != nil {
+				return fmt.Errorf("refusing to remove Docker project %s: %w", dm.projectName, err)
+			}
+		}
+		return dm.down(closeCtx, SafeDownOptions())
+	}
+	if dm.projectLease != nil {
+		return dm.projectLease.release(ctx, down)
+	}
+	return down(ctx)
+}
+
+// Down removes the Compose project without deleting images or volumes.
 func (dm *DockerManager) Down() error {
-	// Uses a fresh context to ensure cleanup succeeds even if original context was canceled
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	return dm.DownWithOptions(context.Background(), SafeDownOptions())
+}
+
+// DownWithOptions removes the Compose project using explicit cleanup options.
+func (dm *DockerManager) DownWithOptions(ctx context.Context, opts DownOptions) error {
+	unlockSharedOperation := func() {}
+	if dm.projectLease != nil && dm.projectLease.Lifecycle() == LifecycleShared {
+		var err error
+		unlockSharedOperation, err = dm.projectLease.lockSharedOperation(ctx, true)
+		if err != nil {
+			return fmt.Errorf("shared project %s cannot be removed: %w", dm.projectName, err)
+		}
+		defer unlockSharedOperation()
+	}
+	if dm.projectLease != nil && !dm.projectLease.isLegacy() {
+		if err := validateProjectOwnership(cleanupParent(ctx), dm.projectName, dm.projectLease.Labels()); err != nil {
+			return fmt.Errorf("refusing to remove Docker project %s: %w", dm.projectName, err)
+		}
+	}
+	return dm.down(ctx, opts)
+}
+
+func (dm *DockerManager) down(ctx context.Context, opts DownOptions) error {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(cleanupParent(ctx), opts.Timeout)
 	defer cancel()
 	return dm.service.Down(ctx, dm.projectName, api.DownOptions{
-		RemoveOrphans: true,
-		Volumes:       true,    // Remove volumes as well
-		Images:        "local", // Remove locally built images
+		Project:       dm.project,
+		RemoveOrphans: opts.RemoveOrphans,
+		Volumes:       opts.RemoveVolumes,
+		Images:        opts.RemoveImages,
+		Timeout:       &opts.Timeout,
 	})
+}
+
+func downComposeProject(ctx context.Context, projectName string, project *types.Project, opts DownOptions) error {
+	service, err := newComposeService()
+	if err != nil {
+		return err
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(cleanupParent(ctx), opts.Timeout)
+	defer cancel()
+	return service.Down(ctx, projectName, api.DownOptions{
+		Project:       project,
+		RemoveOrphans: opts.RemoveOrphans,
+		Volumes:       opts.RemoveVolumes,
+		Images:        opts.RemoveImages,
+		Timeout:       &opts.Timeout,
+	})
+}
+
+func (dm *DockerManager) hasManagedOwnership() (bool, error) {
+	if dm.projectLease == nil {
+		return false, nil
+	}
+	if err := validateProjectOwnership(dm.ctx, dm.projectName, dm.projectLease.Labels()); err != nil {
+		if errors.Is(err, ErrOwnershipMismatch) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (dm *DockerManager) ContainerID(ctx context.Context, serviceName string) (string, error) {
+	containers, err := dm.service.Ps(ctx, dm.projectName, api.PsOptions{
+		All:      true,
+		Services: []string{serviceName},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(containers) == 0 {
+		return "", fmt.Errorf("service %s has no container in project %s", serviceName, dm.projectName)
+	}
+	return containers[0].ID, nil
+}
+
+func (dm *DockerManager) PublishedPort(ctx context.Context, serviceName string, targetPort uint16) (string, int, error) {
+	return dm.service.Port(ctx, dm.projectName, serviceName, targetPort, api.PortOptions{Protocol: "tcp", Index: 1})
 }
 
 // Status returns the current status of containers
@@ -407,5 +625,3 @@ func placeholder3456543() {
 	color.Redln(" 𝒻*** 𝓎ℴ𝓊 𝒸ℴ𝓂𝓅𝒾𝓁ℯ𝓇")
 	pp.Println("𝓯*** 𝔂𝓸𝓾 𝓬𝓸𝓶𝓹𝓲𝓵𝓮𝓻")
 }
-
-

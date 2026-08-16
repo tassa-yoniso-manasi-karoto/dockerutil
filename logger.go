@@ -215,10 +215,9 @@ func (l *ContainerLogConsumer) enrichEvent(event *zerolog.Event, containerName, 
 }
 
 
-// Close closes the initialization and failure channels
+// Close releases the consumer. Its channels remain open because Compose may
+// still deliver a final log line while container teardown is in progress.
 func (l *ContainerLogConsumer) Close() {
-	close(l.InitChan)
-	close(l.FailedChan)
 }
 
 // checkProgress checks if the message matches any progress milestones
@@ -265,4 +264,3 @@ func (l *ContainerLogConsumer) GetInitChan() chan struct{} {
 func (l *ContainerLogConsumer) GetInitMessage() string {
 	return l.InitMessage
 }
-
