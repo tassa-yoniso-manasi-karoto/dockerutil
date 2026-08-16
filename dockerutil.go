@@ -86,15 +86,20 @@ type DownOptions struct {
 	RemoveOrphans bool
 	RemoveVolumes bool
 	RemoveImages  string
-	Timeout       time.Duration
+	// Timeout optionally overrides the containers' configured stop grace period.
+	// A zero value lets Docker use each container's configured grace period.
+	Timeout time.Duration
+	// OperationTimeout bounds the complete Compose down operation, including
+	// stopping containers and removing project resources.
+	OperationTimeout time.Duration
 }
 
 func SafeDownOptions() DownOptions {
 	return DownOptions{
-		RemoveOrphans: true,
-		RemoveVolumes: false,
-		RemoveImages:  "",
-		Timeout:       60 * time.Second,
+		RemoveOrphans:   true,
+		RemoveVolumes:   false,
+		RemoveImages:    "",
+		OperationTimeout: 75 * time.Second,
 	}
 }
 
@@ -488,17 +493,15 @@ func (dm *DockerManager) DownWithOptions(ctx context.Context, opts DownOptions) 
 }
 
 func (dm *DockerManager) down(ctx context.Context, opts DownOptions) error {
-	if opts.Timeout <= 0 {
-		opts.Timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(cleanupParent(ctx), opts.Timeout)
+	stopTimeout, operationTimeout := resolveDownTimeouts(opts)
+	ctx, cancel := context.WithTimeout(cleanupParent(ctx), operationTimeout)
 	defer cancel()
 	return dm.service.Down(ctx, dm.projectName, api.DownOptions{
 		Project:       dm.project,
 		RemoveOrphans: opts.RemoveOrphans,
 		Volumes:       opts.RemoveVolumes,
 		Images:        opts.RemoveImages,
-		Timeout:       &opts.Timeout,
+		Timeout:       stopTimeout,
 	})
 }
 
@@ -507,18 +510,32 @@ func downComposeProject(ctx context.Context, projectName string, project *types.
 	if err != nil {
 		return err
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(cleanupParent(ctx), opts.Timeout)
+	stopTimeout, operationTimeout := resolveDownTimeouts(opts)
+	ctx, cancel := context.WithTimeout(cleanupParent(ctx), operationTimeout)
 	defer cancel()
 	return service.Down(ctx, projectName, api.DownOptions{
 		Project:       project,
 		RemoveOrphans: opts.RemoveOrphans,
 		Volumes:       opts.RemoveVolumes,
 		Images:        opts.RemoveImages,
-		Timeout:       &opts.Timeout,
+		Timeout:       stopTimeout,
 	})
+}
+
+func resolveDownTimeouts(opts DownOptions) (*time.Duration, time.Duration) {
+	var stopTimeout *time.Duration
+	if opts.Timeout > 0 {
+		stopTimeout = &opts.Timeout
+	}
+
+	operationTimeout := opts.OperationTimeout
+	if operationTimeout <= 0 {
+		operationTimeout = 75 * time.Second
+	}
+	if opts.Timeout > 0 && operationTimeout <= opts.Timeout {
+		operationTimeout = opts.Timeout + 15*time.Second
+	}
+	return stopTimeout, operationTimeout
 }
 
 func (dm *DockerManager) hasManagedOwnership() (bool, error) {
